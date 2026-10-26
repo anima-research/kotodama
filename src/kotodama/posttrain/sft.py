@@ -10,6 +10,11 @@ Data, ``--format transcript`` (default): JSONL rows ``{"turns": [{"speaker", "te
 ``<|im_end|>`` train (kotodama.posttrain.chat_data). Either way, examples are packed into rows with per-conversation
 attention segments.
 
+``--lora_rank N`` trains a LoRA adapter (kotodama.posttrain.lora) on the frozen model instead of the full weights;
+``--lora_layers`` picks unique layers by group (prelude / core / coda) or index, and checkpoints are adapter
+directories that ``kotodama.serve.server --adapter`` merges at load. The hybrid optimizer sends the adapter matrices to
+Muon, as it does every hidden matrix; ``--optimizer adamw`` trains them with AdamW.
+
 Recipe: Muon + AdamW split, WSD schedule from ``--warmup_ratio`` / ``--decay_start_pct``, loss =
 mean over the micro-batch's trainable tokens (z-loss included), divided by grad-accum (the "intended" scaling, so
 gradient clipping is meaningful), eval loss + <|im_end|> top-1 accuracy. Not ported: the geometric probe battery
@@ -32,6 +37,7 @@ import torch
 
 from kotodama.posttrain import chat_data as cd
 from kotodama.posttrain import common
+from kotodama.posttrain import lora
 from kotodama.presets import TOKENIZER_NAME
 from kotodama.serve.chatml import EOS_TOKEN_ID, IM_END_TOKEN_ID
 
@@ -43,6 +49,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     common.add_model_args(p)
     common.add_optim_args(p, muon_lr=1e-3, adamw_lr=1e-4, warmup_ratio=0.05, decay_start_pct=1.0,
                           decay_type="sqrt")
+    lora.add_args(p)
     g = p.add_argument_group("data / loop")
     g.add_argument("--format", default="transcript", choices=["transcript", "chatml"])
     g.add_argument("--train_speakers", default="all",
@@ -168,12 +175,27 @@ def main(argv: list[str] | None = None) -> int:
                 a.micro_batch_size, a.grad_accum, total_steps)
 
     model = common.load_policy(a)
+    if a.lora_rank:
+        alpha = a.lora_alpha if a.lora_alpha is not None else 2.0 * a.lora_rank
+        layers = lora.resolve_layers(a.lora_layers, model.config)
+        targets = [t.strip() for t in a.lora_targets.split(",") if t.strip()]
+        trainable = lora.attach(model, a.lora_rank, alpha, targets, layers, a.lora_dropout)
+        logger.info("LoRA rank %d alpha %g on %d layers x %s: %.2fM trainable params", a.lora_rank, alpha, len(layers),
+                    ",".join(targets), sum(p.numel() for p in trainable.values()) / 1e6)
     fwd = common.compiled(model, a)
     muon, adamw, sched = common.build_optim(model, a, total_steps)
     tel = common.Telemetry(out_dir)
     sig = common.SigtermFlag()
     meta = {"engine": "kotodama.posttrain.sft", "base": str(a.checkpoint), "train_jsonl": str(a.train_jsonl)}
+    if a.lora_rank:
+        meta.update(rank=a.lora_rank, alpha=alpha, targets=targets, layers=layers, model_size=a.model_size)
     ckpt_dir = out_dir / "checkpoints"
+
+    def save(name: str) -> Path:
+        """Weights at ``checkpoints/<name>``: the adapter directory under LoRA, else a full weights checkpoint."""
+        if a.lora_rank:
+            return lora.save(ckpt_dir / f"{name}.adapter", model, {**meta, "step": step})
+        return common.save_weights(ckpt_dir / f"{name}.pt", model, step, meta)
 
     if eval_rows:
         ev = evaluate(model, eval_rows, a.micro_batch_size, a.device)
@@ -209,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
                                    "tok_s": a.grad_accum * a.micro_batch_size * a.max_seq_len / max(dt, 1e-9)}
             logger.info("step %d/%d loss %.4f gn %.2f lr %.2e", step, total_steps, loss, gn, lrs["muon_lr"])
             if not math.isfinite(loss):
-                common.save_weights(ckpt_dir / f"step_{step:08d}.nonfinite.pt", model, step, meta)
+                save(f"step_{step:08d}.nonfinite")
                 raise SystemExit(f"non-finite loss at step {step}")
             if a.eval_every and eval_rows and step % a.eval_every == 0:
                 rec.update(evaluate(model, eval_rows, a.micro_batch_size, a.device))
@@ -218,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             loss_acc.zero_()
             tok_acc.zero_()
             if a.save_every and step % a.save_every == 0 and step < total_steps:
-                common.save_weights(ckpt_dir / f"step_{step:08d}.pt", model, step, meta)
+                save(f"step_{step:08d}")
             if sig.received or step >= total_steps:
                 done = True
                 break
@@ -226,14 +248,17 @@ def main(argv: list[str] | None = None) -> int:
         if epoch >= math.ceil(a.epochs) and not a.max_steps:
             done = True
 
-    final = common.save_weights(ckpt_dir / f"step_{step:08d}.pt", model, step, meta)
+    final = save(f"step_{step:08d}")
     if eval_rows:
         ev = evaluate(model, eval_rows, a.micro_batch_size, a.device)
         logger.info("final eval: %s", ev)
         tel.log(step, **ev)
     tel.close()
     sig.restore()
-    (out_dir / "final.json").write_text(json.dumps({"checkpoint": str(final), "steps": step}, indent=1))
+    summary: dict[str, Any] = {"checkpoint": str(final), "steps": step}
+    if a.lora_rank:
+        summary["adapter"] = True
+    (out_dir / "final.json").write_text(json.dumps(summary, indent=1))
     return 0
 
 
