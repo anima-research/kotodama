@@ -401,7 +401,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, emulate_casts: bool = False, prefill_buckets: tuple[int, ...] = ()) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, emulate_casts: bool = False, prefill_buckets: tuple[int, ...] = (), adapter: str | None = None) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
     global _compile_store_state, _autotune_min_rows
@@ -467,6 +467,11 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     model = model.to(_device).eval()
     if _device.type == "cuda":
         model = model.bfloat16()
+    if adapter is not None:
+        # Before the engine is built: it binds fused copies of the projection weights at construction.
+        from kotodama.posttrain import lora
+
+        lora.merge(model, adapter)
 
     use_engine = engine == "fast" and _device.type == "cuda" and _ENGINE_AVAILABLE and config.attn_res
     if engine == "fast" and not use_engine:
@@ -1671,6 +1676,7 @@ def _record_startup() -> None:
                        seconds, _startup_budget_s_arg, _startup_info)
     else:
         logger.info("startup: ready after %.0fs (budget %.0fs; %s)", seconds, _startup_budget_s_arg, _startup_info)
+_adapter_arg: str | None = None  # CLI --adapter: a LoRA adapter directory merged into the weights at load
 
 
 @asynccontextmanager
@@ -1705,6 +1711,7 @@ async def lifespan(app: FastAPI):
         regional=_regional_arg,
         autotune_min_rows=_autotune_min_rows_arg,
         emulate_casts=_emulate_casts_arg,
+        adapter=_adapter_arg,
     )
     sign_task = _start_signing()
     _open_request_log()
@@ -1949,13 +1956,14 @@ def _model_name() -> str:
     """Canonical served model id, e.g. 'kotodama-3b-instruct'.
 
     Priority: explicit --served_model_name > derived from architecture size
-    (--model_size) + serving mode.
+    (--model_size) + serving mode, plus ``+<adapter>`` when --adapter merged one.
     """
     if _served_name_override:
         return _served_name_override
     size_label = SIZE_LABELS.get(_model_size_arg, _model_size_arg)
     mode_label = "instruct" if _serve_mode == "chat" else "base"
-    return f"kotodama-{size_label}-{mode_label}"
+    adapter_label = f"+{Path(_adapter_arg).name.removesuffix('.adapter')}" if _adapter_arg else ""
+    return f"kotodama-{size_label}-{mode_label}{adapter_label}"
 
 
 app = FastAPI(title="kotodama", lifespan=lifespan)
@@ -3499,6 +3507,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="With --sign_spool: /info's sign.disk reads low (and a warning is logged) while the "
                              "spool's filesystem has less than this free; python -m kotodama.serve.sign_archive moves "
                              "signed batches to long-term storage")
+    parser.add_argument("--adapter", default=None,
+                        help="LoRA adapter directory (kotodama.posttrain.sft --lora_rank) merged into the weights at "
+                             "load; the served model id gains +<directory name, less any .adapter suffix>")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,
@@ -3522,6 +3533,7 @@ if __name__ == "__main__":
     inferred_mode = "chat" if "instruct" in args.checkpoint else "base"
 
     _served_name_override = args.served_model_name
+    _adapter_arg = args.adapter
     _device_arg = args.device
     _mode_arg = args.mode if args.mode is not None else inferred_mode
     _model_size_arg = args.model_size
