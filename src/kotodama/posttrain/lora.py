@@ -15,6 +15,7 @@ the server merges an adapter without peft.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -118,10 +119,12 @@ def save(directory: Path, model: torch.nn.Module, meta: dict[str, Any]) -> Path:
 
 def merge(model: torch.nn.Module, directory: str | Path) -> dict[str, Any]:
     """Add the adapter in ``directory`` into ``model``'s weights in place: W <- W + (alpha / rank) * B @ A, summed in
-    fp32 and stored in W's dtype. Returns the adapter's metadata.
+    fp32 and stored in W's dtype. Returns the adapter's identity: its name (the directory's, less any ``.adapter``
+    suffix), rank, alpha, the number of modules merged and the sha256 of WEIGHTS_FILE, which tells apart adapters
+    that share a name.
 
     Rounding the sum into a bf16 weight discards the part of the update below that weight's precision, which peft's
-    unmerged forward keeps.
+    unmerged forward keeps; merging into fp32 weights and casting after rounds once.
     """
     from safetensors.torch import load_file
 
@@ -143,4 +146,5 @@ def merge(model: torch.nn.Module, directory: str | Path) -> dict[str, Any]:
             w.copy_((w.float() + scale * (b @ a.to(w.device, torch.float32))).to(w.dtype))
             merged += 1
     logger.info("merged adapter %s: %d modules, rank %d, alpha %g", directory, merged, meta["rank"], meta["alpha"])
-    return meta
+    return {"name": directory.name.removesuffix(".adapter"), "rank": meta["rank"], "alpha": meta["alpha"],
+            "modules": merged, "sha256": hashlib.sha256((directory / WEIGHTS_FILE).read_bytes()).hexdigest()}

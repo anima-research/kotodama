@@ -223,6 +223,7 @@ _prefix_pool: "PrefixKVCache | None" = None
 # median norms are keyed by LAYER. The engine receives a per-request WRITES
 # list [(site_layer, unit_vec, alpha * site_median_norm), ...] via set_steer.
 _steer_loaded: bool = False
+_adapter: dict | None = None  # the merged LoRA adapter's identity (kotodama.posttrain.lora.merge), or None
 _steer_bank: dict[str, tuple[int, "torch.Tensor"]] = {}
 _steer_meds: dict[int, float] = {}
 _steer_aliases: dict[str, tuple[str | None, float, str]] = {}
@@ -407,7 +408,10 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     global _compile_store_state, _autotune_min_rows
     _compile_mode, _warm_truncated, _regional = compile_mode, bool(warm_truncated), bool(regional)
     _autotune_min_rows = int(autotune_min_rows)
-    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms
+    global _steer_loaded, _steer_bank, _steer_meds, _steer_aliases, _steer_partial_norms, _adapter
+    if adapter is not None and steer_npz is not None:
+        # The banks' vectors and the median norms that dose them are measurements of the base weights.
+        raise ValueError("--steer-npz is calibrated on the base model and does not describe it with --adapter merged")
     _serve_mode = mode
     _stop_token_ids = CHAT_STOP_TOKEN_IDS if mode == "chat" else BASE_STOP_TOKEN_IDS
     # first: a tokenizer that cannot load fails the start in seconds, not after the engine has compiled
@@ -465,13 +469,15 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     gc.collect()
 
     model = model.to(_device).eval()
-    if _device.type == "cuda":
-        model = model.bfloat16()
+    _adapter = None
     if adapter is not None:
-        # Before the engine is built: it binds fused copies of the projection weights at construction.
+        # Before the bf16 cast, so the weights round once, and before the engine is built: it binds fused copies of
+        # the projection weights at construction. The identity on the model names it in capture_identity.
         from kotodama.posttrain import lora
 
-        lora.merge(model, adapter)
+        _adapter = model.adapter_identity = lora.merge(model, adapter)
+    if _device.type == "cuda":
+        model = model.bfloat16()
 
     use_engine = engine == "fast" and _device.type == "cuda" and _ENGINE_AVAILABLE and config.attn_res
     if engine == "fast" and not use_engine:
@@ -819,6 +825,7 @@ class ModelInfo(BaseModel):
     request_log: dict | None = None  # --request_log: its dir, writer and row counts
     kv_sessions: dict | None = None  # --kv_sessions: the open sessions, their lengths and cache states
     memory: dict | None = None
+    adapter: dict | None = None
 
 
 # ── /logprobs: batched prefill-only scoring (the four-register rider battery) ──
@@ -990,6 +997,10 @@ def _check_span(request: GenerateRequest) -> None:
         raise HTTPException(400, "steer_span 'uniform' needs a server started with --levers")
     if request.injection is not None and not _levers:
         raise HTTPException(400, "'injection' needs a server started with --levers")
+    if request.injection is not None and _adapter is not None:
+        # Injection doses (and the act lever's mu) are measured on the base weights, which the merged adapter moves.
+        raise HTTPException(400, f"'injection' is calibrated on the base model; not served with an adapter merged "
+                                 f"({_adapter['name']})")
 
 
 @contextlib.contextmanager
@@ -2034,6 +2045,7 @@ async def info():
                                                 "hits": _pins.hits, "recorded": _pins.recorded,
                                                 "misses": len(_pins.misses), "digest": _pins.digest},
         memory=_memory_info(),
+        adapter=_adapter,
     )
 
 
@@ -3509,7 +3521,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "signed batches to long-term storage")
     parser.add_argument("--adapter", default=None,
                         help="LoRA adapter directory (kotodama.posttrain.sft --lora_rank) merged into the weights at "
-                             "load; the served model id gains +<directory name, less any .adapter suffix>")
+                             "load; the served model id gains +<directory name, less any .adapter suffix> and /info "
+                             "reports its rank, alpha, modules and digest. Steering calibrated on the base model "
+                             "(--steer-npz, 'injection' requests) is refused with it")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,

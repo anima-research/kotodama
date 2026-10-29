@@ -2,6 +2,8 @@
 SFT run that trains only the adapter, and the server merging an adapter at load. CPU, fp32."""
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 
 import pytest
@@ -90,8 +92,9 @@ def test_save_then_merge_reproduces_the_adapted_model(tmp_path) -> None:
     lora.save(tmp_path / "a.adapter", adapted, {"rank": 4, "alpha": 8.0})
 
     merged = _model()
-    meta = lora.merge(merged, tmp_path / "a.adapter")
-    assert meta["rank"] == 4
+    identity = lora.merge(merged, tmp_path / "a.adapter")
+    digest = hashlib.sha256((tmp_path / "a.adapter" / lora.WEIGHTS_FILE).read_bytes()).hexdigest()
+    assert identity == {"name": "a", "rank": 4, "alpha": 8.0, "modules": len(trainable) // 2, "sha256": digest}
     with torch.no_grad():
         want, got, base = adapted(_ids())["logits"], merged(_ids())["logits"], _model()(_ids())["logits"]
     assert not torch.allclose(want, base, atol=1e-3)  # the adapter really changes the model
@@ -175,3 +178,39 @@ def test_server_merges_an_adapter_at_load(tiny_ckpt, tok, tmp_path, monkeypatch)
     with torch.no_grad():
         assert torch.allclose(served(_ids())["logits"], want(_ids())["logits"], atol=1e-5)
     assert server._model_name().endswith("+wry")
+    assert served.adapter_identity == server._adapter and server._adapter["name"] == "wry"
+    monkeypatch.setattr(server, "_model", served)
+    monkeypatch.setattr(server, "_checkpoint_path", str(tiny_ckpt))
+    assert asyncio.run(server.info()).adapter == server._adapter
+    from kotodama.model.signing import weights_digest
+
+    assert weights_digest(served) != weights_digest(_model())  # signatures and request logs name the merged weights
+
+
+def test_server_refuses_base_calibrated_steering_with_an_adapter(tiny_ckpt, tmp_path, monkeypatch) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+
+    from kotodama.serve import server
+
+    with pytest.raises(ValueError, match="steer-npz"):
+        server.load_model(str(tiny_ckpt), device="cpu", model_size="tiny-loop", engine="reference",
+                          steer_npz="bank.npz", adapter=str(tmp_path / "wry.adapter"))
+    monkeypatch.setattr(server, "_levers", 4)
+    monkeypatch.setattr(server, "_adapter", {"name": "wry"})
+    for injection in ({"sites": [3], "vectors": [[0.0] * 8]}, {"sites": [3], "kind": "act", "neurons": [5], "mu": [0.1]}):
+        with pytest.raises(HTTPException, match="calibrated on the base model") as err:
+            server._check_span(server.GenerateRequest(prompt="hi", injection=injection))
+        assert err.value.status_code == 400
+    server._check_span(server.GenerateRequest(prompt="hi"))  # an unsteered request is served
+
+
+def test_capture_identity_names_a_merged_adapter(monkeypatch) -> None:
+    from kotodama.model.capture import capture_identity
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    model = _model()
+    base = capture_identity(model)
+    assert "adapter" not in base  # a base model's lane id is unchanged
+    model.adapter_identity = {"name": "wry", "rank": 4, "alpha": 8.0, "modules": 3, "sha256": "ab" * 32}
+    assert capture_identity(model) == {**base, "adapter": model.adapter_identity}
