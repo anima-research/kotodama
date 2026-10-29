@@ -93,7 +93,7 @@ runner per eval, scored with the same math.
 | task | command |
 |---|---|
 | one model | `tools/run_serve.sh --checkpoint <ckpt> [--mode chat] [--model_size <shape>]` |
-| one model with a LoRA adapter | `tools/run_serve.sh --checkpoint <base> --adapter <dir>.adapter ...` (the adapter is merged into the weights at load; the served model id gains `+<dir name>` without `.adapter`) |
+| one model with a LoRA adapter | `tools/run_serve.sh --checkpoint <base> --adapter <dir>.adapter ...` (the adapter is merged into the weights at load. The served model id gains `+<dir name>` without `.adapter`, and `/info` reports the adapter's rank, alpha, module count and digest. Steering calibrated on the base model, `--steer-npz` and `injection` requests, is refused) |
 | the public 3B base | `tools/serve_3b_base.sh` (downloads the checkpoint once, then serves it) |
 | the released kotodama-tsumugi 1B base | `tools/run_serve.sh --profile tsumugi-1b-quick` (`configs/serve/tsumugi-1b-quick.yaml`: the published weights from the Hub on any one GPU, compiled without kernel benchmarking so it starts in minutes, two batched row buckets, cascade attention, the prefix KV pool, per-request steering, seeded candidates, top-p / min-p; any flag after it overrides the profile, e.g. `--checkpoint <dir>`, `--port`, `--steer-npz <banks>`; requests set sampling: the `tsumugi` law in `kotodama.serve.laws` is temperature 0.75, top-p off, repetition 1.2) |
 | tsumugi under sustained load | `tools/run_serve.sh --profile tsumugi-1b` (four row buckets up to 128 rows, max-autotune kernels: a long first compile, then more throughput; `--compile_store <dir>` or `$KOTODAMA_COMPILE_STORE` keeps the compiled artifacts so later starts with the same code, runtime and GPU load them) |

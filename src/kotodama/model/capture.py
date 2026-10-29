@@ -735,14 +735,17 @@ def replay_extract_koto(
 def capture_identity(model) -> dict:
     """What a kotodama capture's arithmetic is made of, for a reduction's lane id:
     this module's and the model code's source digests, the pinned lane, the
-    weights' dtype, the AttnRes and loop geometry, and the fp64-eps compat mode."""
+    weights' dtype, the AttnRes and loop geometry, the fp64-eps compat mode, and
+    a merged LoRA adapter's identity when the model carries one
+    (``adapter_identity``, set by the server's load): the adapter changes the
+    weights, so its captures are a lane of their own, not the base model's."""
     import hashlib
     import os
     from pathlib import Path
 
     here = Path(__file__)
     cfg = model.config
-    return dict(
+    identity = dict(
         producer="kotodama.model.capture",
         source_sha256={
             f.name: hashlib.sha256(f.read_bytes()).hexdigest()
@@ -756,6 +759,10 @@ def capture_identity(model) -> dict:
         rope_fp32=bool(getattr(cfg, "rope_fp32", False)),
         attnres_eps_fp64_compat=os.environ.get("KOTODAMA_ATTNRES_EPS_FP64_COMPAT", "0") == "1",
     )
+    adapter = getattr(model, "adapter_identity", None)
+    if adapter is not None:  # absent for a base model, whose lane id is unchanged
+        identity["adapter"] = dict(adapter)
+    return identity
 
 
 @torch.no_grad()
