@@ -19,6 +19,7 @@ Optional attention backends (--attn_impl):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -851,13 +852,18 @@ class SwiGLUFFN(nn.Module):
 class TransformerBlock(nn.Module):
     """Standard pre-norm transformer block, with optional Block AttnRes."""
 
-    def __init__(self, config: KotodamaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig, aliased: bool = False) -> None:
         super().__init__()
         NormClass = _select_norm_class(config)
+        # aliased: a loop repeat whose attn/ffn KotodamaModel replaces with its core position's before any use, built
+        # on the meta device so they take no memory.
+        heavy = torch.device("meta") if aliased else contextlib.nullcontext()
         self.attn_norm = NormClass(config.hidden_size, eps=config.norm_eps)
-        self.attn = GQAttention(config)
+        with heavy:
+            self.attn = GQAttention(config)
         self.ffn_norm = NormClass(config.hidden_size, eps=config.norm_eps)
-        self.ffn = SwiGLUFFN(config)
+        with heavy:
+            self.ffn = SwiGLUFFN(config)
 
         # Block AttnRes: per-layer pseudo-queries and key norms.
         # Always use custom RMSNorm — _route_static() accesses norm.eps
@@ -926,7 +932,11 @@ class KotodamaModel(nn.Module):
     - torch.compile compatibility (standard ops only)
     """
 
-    def __init__(self, config: KotodamaModelConfig) -> None:
+    def __init__(self, config: KotodamaModelConfig, init_weights: bool = True) -> None:
+        """``init_weights=False`` is for a caller that loads every weight from a checkpoint next: it skips the init
+        pass, and the loop repeats build no attn/ffn of their own, so construction holds one copy of the unique
+        weights instead of one per effective position. The default draws the initialization exactly as it always
+        has (the repeats' discarded modules consume the generator too), so a seed keeps giving the same model."""
         super().__init__()
         self.config = config
         self._use_liger = config.use_liger and _LIGER_AVAILABLE
@@ -938,7 +948,8 @@ class KotodamaModel(nn.Module):
             )
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList([TransformerBlock(config, aliased=not init_weights and config.layer_source(i) != i)
+                                     for i in range(config.num_layers)])
         # Looped depth: alias the heavy modules of loop repeats to their core position (see KotodamaModelConfig).
         # Everything that walks self.layers (AttnRes, capture, decode, KV caches) sees one block per position;
         # named_parameters()/parameters() dedup the shared weights, so the optimizer steps each once.
@@ -1039,7 +1050,8 @@ class KotodamaModel(nn.Module):
         self.register_buffer("rope_sin", rope_sin, persistent=False)
 
         # Initialize weights
-        self._init_weights()
+        if init_weights:
+            self._init_weights()
 
     def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
         super()._apply(fn, recurse)

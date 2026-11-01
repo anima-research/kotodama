@@ -156,7 +156,7 @@ def load_model(
     import dataclasses
     valid_fields = {f.name for f in dataclasses.fields(KotodamaModelConfig)}
     cfg = {k: v for k, v in cfg.items() if k in valid_fields}
-    model = KotodamaModel(KotodamaModelConfig(**cfg))
+    model = KotodamaModel(KotodamaModelConfig(**cfg), init_weights=False)  # the checkpoint supplies the weights
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
 
     # Report key mismatches (filter out expected AttnRes key mismatches)

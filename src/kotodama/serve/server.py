@@ -448,7 +448,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     logger.info("Model config (%s): %dM params", model_size, config.param_count() // 1_000_000)
     logger.info("Serving context limit: %d tokens", _max_seq_len)
 
-    model = KotodamaModel(config)
+    model = KotodamaModel(config, init_weights=False)  # every weight is loaded below (strict)
 
     ckpt_path = checkpoint_path if ckpt.is_hf_ref(checkpoint_path) else Path(checkpoint_path)
     if not ckpt.is_hf_ref(ckpt_path) and not Path(ckpt_path).exists():
