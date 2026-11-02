@@ -342,9 +342,10 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
     # an in-flight row waiting for its reduce is "not signed yet", not unknown
     r = client.post("/replay", json={"sign_id": choices[0]["sign_id"]})
     assert r.status_code == 409 and "not signed yet" in r.text
-    with torch.inference_mode():
-        server._sign_flush()
+    with torch.inference_mode():  # the server stops with rows still pending: they are reduced before it exits
+        asyncio.run(server._sign_flush_at_shutdown())
     assert server._sign_pending == [] and server._sign_stats["inflight_batches"] == 1
+    assert server._sign_stats["errors"] == 0
     timing = server._sign_info()["inflight_timing"]
     assert timing["reduce_s"] > 0 and timing["signed_rows"] >= 2 and "write_s" in timing and "export_s" in timing
     index = [json.loads(x) for x in open(tmp_path / "spool" / "index.jsonl")]
@@ -449,6 +450,30 @@ def test_server_signs_in_flight(monkeypatch, model: KotodamaModel, tmp_path) -> 
 
 
 @torch.inference_mode()
+def test_a_shutdown_whose_reduce_fails_spools_the_pending_records_for_the_drain(monkeypatch, tmp_path) -> None:
+    pytest.importorskip("fastapi")
+    from kotodama.serve import server
+    from kotodama.serve.sign import SignSpool
+
+    class _Signer:
+        def why_not(self, rec):
+            return None if rec.generated_ids else "nothing generated"
+
+    async def failing_run(fn, *args, **kwargs):
+        raise RuntimeError("the reducer failed")
+
+    recs = [SignRecord(request_id=f"r-{i}", prompt_ids=(1, 2, 3), generated_ids=(4, 5) if i else (),
+                       weights="w" * 64) for i in range(3)]
+    spool = SignSpool(tmp_path / "spool")
+    for k, v in {"_signer": _Signer(), "_sign_spool": spool, "_sign_writer": "replica-a", "_run_generation": failing_run,
+                 "_sign_pending": [(rec, None, None) for rec in recs], "_sign_unwritten": [], "_sign_reducing": 0,
+                 "_sign_stats": {"records": 3, "batches": 0, "signed": 0, "skipped": 0, "errors": 0}}.items():
+        monkeypatch.setattr(server, k, v)
+    asyncio.run(server._sign_flush_at_shutdown())
+    assert server._sign_pending == [] and spool.pending() == 2  # the record with nothing to sign is counted lost
+    assert server._sign_stats["errors"] == 1
+
+
 def test_warm_hands_the_reducer_one_batch(model: KotodamaModel) -> None:
     eng = DecodeEngine(model, max_seq_len=MAX_SEQ, dtype=torch.float32, prefill_backends=[SDPBackend.MATH], levers=2)
     _, signer = _decoders(eng)

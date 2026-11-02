@@ -1692,6 +1692,7 @@ async def lifespan(app: FastAPI):
         # was cancelled) so the non-daemon worker thread can't stall exit.
         if sign_task is not None:
             sign_task.cancel()
+            await _sign_flush_at_shutdown()
         if _request_log is not None:
             _request_log.close()
         _generate_executor.shutdown(wait=False, cancel_futures=True)
@@ -2538,6 +2539,49 @@ def _sign_flush(full_only: bool = False) -> None:
             _sign_reducing = 0
         if _sign_unwritten:
             return
+
+
+# Time a stopping replica spends reducing its pending in-flight rows (inside the gateway's 10 s termination grace).
+_SIGN_SHUTDOWN_S = 7.0
+
+
+async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
+    """Write the in-flight rows still waiting for their reduce before the server exits, so a request answered just
+    before shutdown keeps its signature: reduced and written in flight when that finishes within ``timeout``, else
+    their records go to the spool's records and the drain signs them. A row neither path can keep is counted and
+    logged."""
+    if _signer is None or _sign_spool is None or not (_sign_pending or _sign_reducing or _sign_unwritten):
+        return
+    waiting = len(_sign_pending) + _sign_reducing + sum(len(r) for r, _ in _sign_unwritten)
+
+    async def flush() -> None:
+        async with _engine_lock:
+            await _run_generation(_sign_flush)
+
+    try:
+        await asyncio.wait_for(flush(), timeout)
+    except Exception:  # a timeout or a failed reduce: what is still pending falls back to the drain
+        logger.exception("sign: shutdown flush of %d in-flight rows did not finish; their records go to the drain",
+                         waiting)
+    with _sign_pending_lock:
+        left = list(_sign_pending)
+        del _sign_pending[:]
+    records = [(rec, plan) for rec, _, plan in left if _signer.why_not(rec) is None]
+    if records:
+        try:
+            _sign_spool.add(_sign_writer, [rec for rec, _ in records],
+                            plans=list({p.digest(): p for _, p in records if p is not None}.values()) or None)
+        except Exception:
+            logger.exception("sign: %d in-flight records could not be written to the spool at shutdown", len(records))
+            records = []
+    # rows still being reduced or held off by another drain's lock when the server exits are not written
+    unfinished = _sign_reducing + sum(len(r) for r, _ in _sign_unwritten)
+    lost = len(left) - len(records) + unfinished
+    if lost:
+        _sign_stats["errors"] += 1
+        logger.error("sign: %d in-flight rows were neither signed nor spooled before shutdown", lost)
+    logger.info("sign: shutdown: %d in-flight rows were pending: %d signed in flight, %d spooled for the drain, "
+                "%d lost", waiting, waiting - len(left) - unfinished, len(records), lost)
 
 
 def _sign_reduce_batch(take: list) -> None:
