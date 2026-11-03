@@ -661,6 +661,14 @@ async def _proxy(request: Request, endpoint: str, path: str) -> Response:
         return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
 
     pool = _fleet.resolve_pool(endpoint, body)
+    if not path.startswith("/v1/") and isinstance(body, dict) and "model" in body:
+        # the native endpoints take no `model` field: the gateway routes on it here and forwards the rest; a name no
+        # pool serves is refused rather than answered by the default pool
+        model = body.pop("model")
+        if model is not None and model not in _fleet.name_to_pool and model not in _fleet.by_pool:
+            logger.warning("400 %s | model %r is not served by this fleet", path, model)
+            return JSONResponse(status_code=400, content={"error": f"model {model!r} is not served by this fleet; "
+                                                                   f"served: {sorted(_fleet.name_to_pool)}"})
     if _overloaded():
         logger.warning("503 %s pool=%s | overloaded (inflight=%d)", path, pool, _fleet.global_inflight)
         return JSONResponse(status_code=503, content={"error": "gateway overloaded, retry shortly"})

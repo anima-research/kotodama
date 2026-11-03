@@ -134,6 +134,44 @@ def test_routes_pass_through_with_their_status(monkeypatch, tmp_path) -> None:
     assert fleet.global_inflight == 0  # every request released its replica
 
 
+def test_native_routes_route_on_model_and_forward_without_it(monkeypatch, tmp_path) -> None:
+    """/generate, /score_tokens and /logprobs take no `model` field: the gateway picks the pool by it and drops it."""
+    import json as _json
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    cfg = gateway.load_config(str(TSUMUGI), [0, 1])
+    cfg.models.append(cfg.models[0].model_copy(update={"key": "sft", "served_model_name": "r1sft", "gpus": [1]}))
+    cfg.models[0] = cfg.models[0].model_copy(update={"gpus": [0]})
+    cfg.workdir = str(tmp_path)
+    fleet = gateway.Fleet(cfg)
+    for r in fleet.replicas:
+        r.healthy = True
+    seen = []
+
+    def backend(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.port, request.url.path, _json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(gateway, "_cfg", cfg, raising=False)
+    monkeypatch.setattr(gateway, "_fleet", fleet, raising=False)
+    monkeypatch.setattr(gateway, "_http", httpx.AsyncClient(transport=httpx.MockTransport(backend)), raising=False)
+    client = TestClient(gateway.app)
+    sft_port = fleet.by_pool["sft"][0].port
+    for path in ("/generate", "/score_tokens", "/logprobs"):
+        assert client.post(path, json={"prompt": "x", "model": "r1sft"}).status_code == 200
+        port, got_path, body = seen[-1]
+        assert port == sft_port and got_path == path and body == {"prompt": "x"}
+    assert client.post("/generate", json={"prompt": "x", "model": "sft"}).status_code == 200  # a pool key routes too
+    assert seen[-1][0] == sft_port and "model" not in seen[-1][2]
+    r = client.post("/generate", json={"prompt": "x", "model": "nope"})
+    assert r.status_code == 400 and "not served" in r.text and len(seen) == 4
+    # the OpenAI routes keep the field (the server's OpenAI surface accepts it)
+    client.post("/v1/completions", json={"prompt": "x", "model": "r1sft"})
+    assert seen[-1][2]["model"] == "r1sft" and fleet.global_inflight == 0
+
+
 def test_token_id_prompts_have_an_affinity_key() -> None:
     a = gateway._affinity_key({"prompt": list(range(100))})
     assert a == gateway._affinity_key({"prompt_ids": list(range(64)) + [7]}) and a.startswith("ids:")
