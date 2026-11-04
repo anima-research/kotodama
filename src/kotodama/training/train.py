@@ -153,18 +153,14 @@ def hm_log(step: int, **metrics: float) -> None:
 _SECRETISH = re.compile(r"(key|secret|passw|auth|credential|_token$|^token$)", re.I)
 
 
-def data_parallel_rank(rank: int, dp_group: Any, legacy_rank0: bool = False) -> int:
+def data_parallel_rank(rank: int, dp_group: Any) -> int:
     """This process's data-partition index.
 
     Under TP, TP peers must share data, so the rank inside the DP group is used. Without TP
-    (``dp_group is None``) every DDP rank is its own data-parallel replica: its global rank.
-    ``legacy_rank0=True`` returns 0 for every rank, so every rank reads rank 0's slice — an
-    effective batch of 1/world_size of the global batch, computed world_size times. It exists
-    only to reproduce runs trained under that regime (pairing a new seed with a ladder arm
-    trained under it); never use it for new science."""
+    (``dp_group is None``) every DDP rank is its own data-parallel replica: its global rank."""
     if dp_group is not None:
         return dist.get_rank(dp_group)
-    return 0 if legacy_rank0 else rank
+    return rank
 
 
 def hm_config(config: dict[str, Any]) -> None:
@@ -858,11 +854,7 @@ def train(args: argparse.Namespace) -> None:
     # -- Data ------------------------------------------------------------------
     # Under TP, all ranks in a TP group must see the same data.
     # Partition by dp_rank so TP peers share batches.
-    dp_rank = data_parallel_rank(rank, dp_group,
-                                 legacy_rank0=getattr(args, "legacy_rank0_data", False))
-    if is_main and getattr(args, "legacy_rank0_data", False):
-        logger.warning("--legacy_rank0_data: EVERY rank reads rank 0's data (the legacy "
-                       "regime) — effective batch = 1/%d of the global batch", dp_size)
+    dp_rank = data_parallel_rank(rank, dp_group)
     if apply_attnres_eps_compat(args) and is_main:
         logger.info("AttnRes eps fp64 compat ON: forward routing runs in fp64 under torch.compile (pre-constexpr numerics)")
     if apply_attnres_stack_grad_chain(args) and is_main:
@@ -2463,14 +2455,6 @@ def parse_args() -> argparse.Namespace:
              "'sdpa': PyTorch SDPA.",
     )
 
-    # Data-parallel partitioning
-    p.add_argument(
-        "--legacy_rank0_data",
-        action="store_true",
-        default=False,
-        help="Reproduce the legacy rank-0-data regime: every DDP rank reads rank 0's data (effective "
-             "batch = global/world_size). ONLY for replicating ladder arms trained under it.",
-    )
 
     # Tensor parallelism
     p.add_argument(

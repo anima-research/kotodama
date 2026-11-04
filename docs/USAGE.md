@@ -176,7 +176,6 @@ Other run-shape flags:
 | `--init_scheme` | `standard` (default) / `mimetic` / `orthogonal` / `depth_graded` / `small_attn_out`, applied over the standard init (`kotodama.model.init_schemes`) |
 | `--mix_data_path`, `--mix_fraction`, `--mix_window START:END` | interleave a second token stream at an exact token fraction (token-debt scheduler, resumable), optionally only inside a global-token window |
 | `--data_seed` | data-order seed, independent of the init `--seed` (default: `--seed`) |
-| `--legacy_rank0_data` | every DDP rank reads rank 0's data (effective batch = global / world size), for reproducing runs trained under that regime |
 
 ### In-loop evals
 

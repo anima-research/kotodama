@@ -33,12 +33,6 @@ published at
 and the [Binding Atlas](https://kotodama.animalabs.ai/binding-atlas) places it
 among public models on referent-binding tests.
 
-An earlier model,
-[kotodama-3b-base](https://huggingface.co/aethera-gp/kotodama-3b-base-final), is a
-3B base trained on 384B tokens (about 48B unique; see `--legacy_rank0_data` in
-`train.py` for the data-loader regime it ran under) with DD-3B AttnRes boundaries
-`0,1,3,7,15,19,24`. Its architecture is frozen.
-
 ## What tsumugi shows
 
 The [Binding Atlas](https://kotodama.animalabs.ai/binding-atlas.html) tests whether a model tracks who *you* is, with judge-free

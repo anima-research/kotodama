@@ -1,5 +1,4 @@
-"""Without TP each DDP rank must read its OWN data partition (legacy_rank0 reproduces the
-every-rank-reads-rank-0 regime on purpose)."""
+"""Without TP each DDP rank must read its OWN data partition."""
 
 from __future__ import annotations
 
@@ -11,10 +10,6 @@ from kotodama.training.train import data_parallel_rank
 
 def test_without_tp_each_rank_is_its_own_partition():
     assert [data_parallel_rank(r, None) for r in range(8)] == list(range(8))
-
-
-def test_legacy_flag_reproduces_the_bug():
-    assert [data_parallel_rank(r, None, legacy_rank0=True) for r in range(8)] == [0] * 8
 
 
 def test_partitions_differ_across_ranks(tmp_path):
