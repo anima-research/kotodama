@@ -11,6 +11,8 @@ server never idles or was started without a reducer. Layout:
                                      identity it was signed under (<batch>/engine.json); batches sort in drain order
     <spool>/index.jsonl              one line per signed batch: its name, directory, host, and row counts
     <spool>/state.json               per records file, the byte offset signed (or skipped) up to
+    <spool>/archived.jsonl           per batch copied to a sign archive, where (kotodama.serve.sign_archive); ``find``
+                                     reads a batch whose own directory is gone from there, through <spool>/restored/
 
 Rows generated elsewhere (or a served row's tokens under another lever: worn vs unworn on the same tokens) enter a
 spool through ``import_rows`` (the command line's --import_rows): one JSON object per line, ``{"id", "ids",
@@ -222,11 +224,17 @@ def find(spool: SignSpool, sign_id: str) -> tuple[Optional[SignRecord], Optional
     row = None
     index = spool.root / "index.jsonl"
     if index.exists():
+        archived_batch = _archived_lookup(spool, sign_id)
         for entry in reversed(index.read_text(encoding="utf-8").splitlines()):
-            batch = Path(json.loads(entry)["dir"])
+            entry = json.loads(entry)
+            batch = Path(entry["dir"])
             rows = batch / "rows.jsonl"
             if not rows.exists():
-                continue
+                # a batch whose spool copy was dropped after archiving: read from the archive's copy
+                restored = archived_batch(str(entry["batch"]))
+                if restored is None:
+                    continue
+                batch, rows = restored, restored / "rows.jsonl"
             for line in rows.read_text(encoding="utf-8").splitlines():
                 if needle in line:
                     cand = json.loads(line)
@@ -235,6 +243,27 @@ def find(spool: SignSpool, sign_id: str) -> tuple[Optional[SignRecord], Optional
             if row is not None:
                 break
     return record, row
+
+
+def _archived_lookup(spool: SignSpool, sign_id: str):
+    """For ``find``: a function from a batch name to a local directory with its archived main-stream files, or None
+    when the archive's index does not list ``sign_id`` in that batch (kotodama.serve.sign_archive)."""
+    from kotodama.serve import sign_archive
+
+    notes = sign_archive.archived(spool.root)
+    archives: dict[str, sign_archive.Archive] = {}
+
+    def lookup(batch: str) -> Optional[Path]:
+        note = notes.get(batch)
+        if note is None:
+            return None
+        arch = archives.setdefault(note["archive"], sign_archive.Archive(note["archive"]))
+        main = arch.batches().get(batch, {}).get("main")
+        if main is None or not any(r[0] == sign_id for r in main.rows):
+            return None
+        return sign_archive.restore_for_spool(spool.root, batch)
+
+    return lookup
 
 
 def import_rows(spool: SignSpool, path: str | Path, writer: str, *, weights: str, engine: Any) -> int:

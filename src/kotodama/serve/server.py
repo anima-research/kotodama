@@ -42,6 +42,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -1628,6 +1629,10 @@ _sign_groups_arg = 16
 _sign_inflight_arg = False
 _sign_audit_every_arg = 100
 _sign_default_arg = False
+# below this much free space on the spool's filesystem, /info's sign.disk reads low (archive the spool:
+# kotodama.serve.sign_archive)
+_sign_disk_floor_gb_arg = 150.0
+_sign_disk_low = False
 _profile_name: str | None = None
 # The request log (--request_log, kotodama.serve.request_log): one row per request, off unless the flag is given.
 _request_log_arg: str | None = None
@@ -2754,10 +2759,27 @@ def _sign_provenance() -> dict[str, Any]:
             "engine_identity": _sign_engine_digest, "inflight": _sign_inflight_arg}
 
 
+def _sign_disk() -> dict:
+    """Free space on the spool's filesystem against --sign_disk_floor_gb (a statvfs; logged once per crossing)."""
+    global _sign_disk_low
+    assert _sign_spool is not None
+    try:
+        free = shutil.disk_usage(_sign_spool.root).free / 1024 ** 3
+    except OSError as exc:
+        return {"error": str(exc), "floor_gb": _sign_disk_floor_gb_arg}
+    low = free < _sign_disk_floor_gb_arg
+    if low and not _sign_disk_low:
+        logger.warning("sign spool: %s has %.0f GB free, under the %.0f GB floor (archive signed batches: python -m "
+                       "kotodama.serve.sign_archive)", _sign_spool.root, free, _sign_disk_floor_gb_arg)
+    _sign_disk_low = low
+    return {"free_gb": round(free, 1), "floor_gb": _sign_disk_floor_gb_arg, "low": low}
+
+
 def _sign_info() -> dict | None:
     if _sign_spool is None:
         return None
     return {"spool": str(_sign_spool.root), "writer": _sign_writer, "weights": _sign_weights,
+            "disk": _sign_disk(),
             "drains_when_idle": _signer is not None, "inflight": _sign_inflight_arg,
             # rows captured and not yet in a written signed batch (waiting, being reduced, or held off by a drain)
             "pending_inflight": len(_sign_pending) + _sign_reducing + sum(len(r) for r, _, _ in _sign_unwritten),
@@ -3473,6 +3495,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "never recorded: every replica's rows are then one lane)")
     parser.add_argument("--sign_audit_every", type=int, default=100,
                         help="With --sign_reducer: keep the raw signed surfaces of 1 row in N (0: none)")
+    parser.add_argument("--sign_disk_floor_gb", type=float, default=150.0,
+                        help="With --sign_spool: /info's sign.disk reads low (and a warning is logged) while the "
+                             "spool's filesystem has less than this free; python -m kotodama.serve.sign_archive moves "
+                             "signed batches to long-term storage")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=2222)
     parser.add_argument("--profile", default=None,
@@ -3637,6 +3663,7 @@ if __name__ == "__main__":
     _kv_sessions_arg = args.kv_sessions
     _kv_session_idle_s_arg = args.kv_session_idle_s
     _sign_audit_every_arg = args.sign_audit_every
+    _sign_disk_floor_gb_arg = args.sign_disk_floor_gb
 
     import uvicorn
 
