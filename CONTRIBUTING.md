@@ -26,7 +26,7 @@ flat YAML whose keys are `train.py` flags, sharing blocks through `extends:`;
 `tests/data/config_snapshot.json` pins every config's effective values and is regenerated only on
 purpose (`KOTODAMA_WRITE_CONFIG_SNAPSHOT=1`). Capture and readout go through
 `kotodama.model.capture`, which is parity-tested against `kotodama.model.llama`; a second AttnRes
-forward mirror is refused. Every task has one golden path, listed in the README; a change adds to
+forward mirror is refused. Every task has one golden path, listed in docs/USAGE.md; a change adds to
 that path rather than beside it.
 
 ## The documentation rule

@@ -1,7 +1,7 @@
 # Kotodama — working in this repo
 
 From-scratch LLM pretraining: NCA pre-pretraining + Block Attention Residuals + Muon.
-One package, `src/kotodama`. `README.md` has the golden paths (one command per task) —
+One package, `src/kotodama`. `docs/USAGE.md` has the golden paths (one command per task) —
 use them; do not add a parallel way to do something that already has one.
 
 - **One table per fact.** Model shapes, AttnRes boundaries, tokenizer: `kotodama/presets.py`.
