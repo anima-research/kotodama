@@ -537,8 +537,9 @@ def archive_spool(spool_root: str | Path, to: str | Path, *, name: Optional[str]
 def drop_local(spool_root: str | Path, *, batches: Optional[list[str]] = None,
                dry_run: bool = False) -> dict[str, Any]:
     """Remove the spool's own copy of archived batches (all of them, or ``batches``): each only after every file in
-    its directory was read back from the archive with the same bytes. Never runs by itself; the 
-    ``<spool>/dropped.jsonl`` lists each removal. Returns counts and the batches refused (with why)."""
+    its directory was read back from the archive with the same bytes. Never runs by itself. ``<spool>/dropped.jsonl``
+    lists each removal, and ``<spool>/ARCHIVED.json`` says where the dropped batches went and how to get one back (a
+    pointer for anything that cites the spool's path). Returns counts and the batches refused (with why)."""
     spool_root = Path(spool_root)
     notes = archived(spool_root)
     index: dict[str, Path] = {}
@@ -582,7 +583,41 @@ def drop_local(spool_root: str | Path, *, batches: Optional[list[str]] = None,
                                         "time": time.time()}) + "\n")
             out["dropped"] += 1
             out["bytes"] += size
+        if out["dropped"] and not dry_run:
+            _write_pointer(spool_root, sorted({notes[n]["archive"] for n in wanted if n in notes}))
     return out
+
+
+def _write_pointer(spool_root: Path, archives: list[str]) -> None:
+    """``<spool>/ARCHIVED.json``: the archives holding the spool's dropped batches, how to read or extract one, and
+    the totals ``<spool>/dropped.jsonl`` records (rewritten after each drop)."""
+    dropped = [json.loads(x) for x in (spool_root / "dropped.jsonl").read_text(encoding="utf-8").splitlines()
+               if x.strip()]
+    prior = spool_root / "ARCHIVED.json"
+    known: list[str] = []
+    if prior.exists():
+        try:
+            known = list(json.loads(prior.read_text()).get("archives", []))
+        except ValueError:
+            known = []
+    archives = sorted(set(known) | set(archives))
+    pointer = {
+        "format": ARCHIVE_FORMAT,
+        "what": "signed batches of this spool were archived and their copies here removed; records/, plans/, "
+                "index.jsonl and state.json stay, and find (and so /replay) reads a removed batch from the archive",
+        "archives": archives,
+        "extract": [f"tools/run_py.sh -m kotodama.serve.sign_archive extract --archive {a} --batch <batch> --to <dir> "
+                    "[--raw]" for a in archives],
+        "reader": "kotodama.serve.sign_archive.Archive(<archive>): locate(sign_id), read_batch(batch), "
+                  "extract_batch(batch, dest)",
+        "batches_dropped": len({d["batch"] for d in dropped}),
+        "bytes_dropped": sum(int(d.get("bytes", 0)) for d in dropped),
+        "last_drop_utc": datetime.fromtimestamp(max(float(d.get("time", 0)) for d in dropped),
+                                                tz=timezone.utc).isoformat(timespec="seconds"),
+    }
+    tmp = spool_root / f".ARCHIVED.{os.getpid()}.json"
+    tmp.write_text(json.dumps(pointer, indent=1) + "\n")
+    os.replace(tmp, prior)
 
 
 def restore_for_spool(spool_root: str | Path, batch: str) -> Optional[Path]:

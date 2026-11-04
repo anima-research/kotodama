@@ -124,6 +124,10 @@ def test_find_and_replay_inputs_resolve_after_the_spool_copy_is_dropped(tmp_path
     out = drop_local(spool.root, batches=[a.name])
     assert out["dropped"] == 1 and out["refused"] == {} and not a.exists() and b.is_dir()
     assert [json.loads(x)["batch"] for x in (spool.root / "dropped.jsonl").read_text().splitlines()] == [a.name]
+    pointer = json.loads((spool.root / "ARCHIVED.json").read_text())
+    assert pointer["batches_dropped"] == 1
+    assert pointer["archives"] == [sign_archive.archived(spool.root)[a.name]["archive"]]
+    assert "extract --archive" in pointer["extract"][0]
     rec2, row2 = find(spool, "a-1")
     assert rec2 == rec and row2["batch_dir"] == str(spool.root / "restored" / a.name)
     assert {k: v for k, v in row2.items() if k != "batch_dir"} == {k: v for k, v in row.items() if k != "batch_dir"}
@@ -149,6 +153,7 @@ def test_drop_local_refuses_what_the_archive_does_not_hold_byte_for_byte(tmp_pat
     (late / "extra").write_text("x")
     out = drop_local(spool.root, batches=[a.name, late.name])
     assert out["dropped"] == 0 and set(out["refused"]) == {a.name, late.name}
+    assert not (spool.root / "ARCHIVED.json").exists()  # nothing dropped, no pointer
     assert "differs" in out["refused"][a.name] and out["refused"][late.name] == "not archived"
     assert a.is_dir() and late.is_dir()
     assert sign_archive.main(["drop_local", "--spool", str(spool.root)]) == 1
