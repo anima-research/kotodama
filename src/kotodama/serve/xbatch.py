@@ -33,10 +33,10 @@ With a signing decoder (``sign_decoder``: a ``CascadeDecoder`` built with ``sign
 decoding the tokens it does), a job that sets ``sign`` decodes there: a batch holding one runs on the signing decoder
 (other jobs of the batch decode on it too, unsigned), and a signed job waits while another decoder runs. When a signed
 candidate ends, its row's span is exported (``MultiSampleDecoder.signed``, trimmed to the positions its generated ids
-fed) into ``XBatchResult.signed``, before the row can start anything else. A signed job whose prefill reused cached
-KV (a prefix cache or pool hit) exports nothing: its prompt's KV came from another prefill's split, so its captured bytes
-would depend on what the cache held. Signed jobs prefill cold for that reason, as seeded ones do; a prefill that still
-reports reused KV leaves its records to the drain, which signs them cold.
+fed) into ``XBatchResult.signed``, before the row can start anything else. A signed job's prompt KV must be what a
+cold prefill writes, as a seeded job's must: it asks for a ``fresh`` prefill, which an engine with batch-invariant
+blocks serves from the caches' prompt KV (the bytes are the same) and any other engine serves cold. A prefill that
+reports reused KV without that guarantee leaves its records to the drain, which signs them cold.
 
 The runner knows nothing about HTTP: prompts arrive tokenized and validated, steering arrives as the engine's
 ``set_steer`` arguments or as a lever plan, and stop strings are checked through a ``decode`` callable (the
@@ -253,8 +253,8 @@ class XBatchRunner:
         slot = 0
         try:
             ids = torch.tensor([job.prompt_ids], dtype=torch.long, device=self.device)
-            # a seeded job's prompt is prefilled cold: its draws must not depend on what a prefix cache held; nor may
-            # a signed job's signature (cached KV came from another prefill's split, with other bytes)
+            # a seeded job's draws must not depend on what a prefix cache held, nor a signed job's signature: their
+            # prefill is cold, or with batch-invariant blocks reads the caches' prompt KV, equal to a cold prefill's
             fresh = {"fresh": True} if job.seed is not None or job.sign else {}
             if job.prefill is not None:  # its own prefill (a session turn: unsteered, never a cache hit)
                 logits, info = job.prefill()
@@ -294,8 +294,10 @@ class XBatchRunner:
         budget = min(job.max_new_tokens, self.max_seq_len - len(job.prompt_ids), dec.token_room(len(job.prompt_ids)))
         if slot:
             timing["lever_slot"] = float(slot)
+        # reused KV whose bytes equal a cold prefill's (batch-invariant blocks) is no reason to withhold a span
+        reused = int(info.get("common_prefix", 0)) if info and not info.get("invariant") else 0
         lv = _Live(job, logits, len(job.prompt_ids), budget, window, timing, t0, out=[[] for _ in range(job.n)],
-                   home=frozenset(rows), slot=slot, kv_reused=int(info.get("common_prefix", 0)) if info else 0)
+                   home=frozenset(rows), slot=slot, kv_reused=reused)
         try:
             self._start(lv, rows, first)
         except Exception as exc:  # the job never joins the batch: its slot and its caller must not wait on it

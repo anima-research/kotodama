@@ -251,9 +251,11 @@ class PrefixKVCache:
         return len(new)
 
     @torch.inference_mode()
-    def prefill(self, input_ids: torch.Tensor, ids: Optional[Sequence[int]] = None) -> tuple[torch.Tensor, dict]:
+    def prefill(self, input_ids: torch.Tensor, ids: Optional[Sequence[int]] = None,
+                prompt_kv_only: bool = False) -> tuple[torch.Tensor, dict]:
         """``DecodeEngine.prefill_cached`` with the pool in front of it. ``ids``: the prompt's token ids as a host
-        list when the caller has them (saves a device read of ``input_ids``)."""
+        list when the caller has them (saves a device read of ``input_ids``). ``prompt_kv_only``: as on
+        ``prefill_cached`` (the pool itself only ever holds prompt KV)."""
         eng = self.engine
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(f"Expected (1, S) input_ids, got {tuple(input_ids.shape)}")
@@ -277,7 +279,7 @@ class PrefixKVCache:
             eng.adopt_prefix(input_ids, pooled)
             loaded = pooled - first_block * b
         t1 = time.perf_counter()
-        logits, info = eng.prefill_cached(input_ids)
+        logits, info = eng.prefill_cached(input_ids, prompt_kv_only=prompt_kv_only)
         t2 = time.perf_counter()
         stored = 0
         n_full = min(plen, eng.prompt_kv_len) // b

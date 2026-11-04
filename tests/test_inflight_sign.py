@@ -258,6 +258,13 @@ def test_signed_jobs_prefill_cold_and_one_that_reused_cached_kv_exports_nothing(
                                    done=lambda o: None, sign=sign))
         runner.run_batch()
     assert asked == [True, False]
+    # a cache hit whose bytes equal a cold prefill's (batch-invariant blocks: the prefill says so) exports its spans
+    runner.prefill = lambda ids, slot=0, **kw: (eng.prefill(ids, slot=slot),
+                                                {"prefix_hit": True, "common_prefix": 8, "invariant": True})
+    runner.queue.put(XBatchJob(key="k", prompt_ids=warm, n=2, max_new_tokens=6, params=HOT,
+                               done=lambda o: out.__setitem__("invariant", o), sign=True))
+    runner.run_batch()
+    assert all(r is not None for r in out["invariant"].signed) and runner.stats["reused_kv_rows"] == 2
 
 
 @torch.inference_mode()

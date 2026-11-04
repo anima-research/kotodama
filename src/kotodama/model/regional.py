@@ -102,6 +102,26 @@ def cache_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[to
     return out.transpose(1, 2).contiguous().view(B, S, -1)
 
 
+def block_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv: tuple[torch.Tensor, ...],
+                 state: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """DecodeEngine's block attention (prefill and extend chunks), ``cache_attend``'s contract with the queries at
+    consecutive ``positions``. On CUDA in bf16/fp16 with flash-attn, the causal KV-cache kernel with one split
+    (kotodama.model.cascade_attn.prefill_flash): every row comes out with the same bytes whatever chunk holds it,
+    so a prompt's KV does not depend on how it was chunked or what a cache held. Elsewhere, ``cache_attend``."""
+    from kotodama.model.cascade_attn import flash_available, prefill_flash
+
+    if not (q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and flash_available()):
+        return cache_attend(q, k, v, kv, state)
+    B, _, S, _ = q.shape
+    k_cache, v_cache = kv
+    _, positions = state
+    k_cache.index_copy_(2, positions, k)
+    v_cache.index_copy_(2, positions, v)
+    lens = (positions[-1:] + 1).to(torch.int32)
+    out = prefill_flash(q.transpose(1, 2), k_cache.transpose(1, 2), v_cache.transpose(1, 2), lens)
+    return out.reshape(B, S, -1)
+
+
 def make_layer(name: str, *, is_boundary: bool, capture: bool, eps: float, n_heads: int, n_kv_heads: int,
                        head_dim: int, intermediate: int, qk_norm: bool, levers: bool, steer: bool,
                        attend: Callable, linear: Callable = F.linear, sign: int = 0, stats: int = 0,

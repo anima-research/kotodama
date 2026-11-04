@@ -263,6 +263,7 @@ def test_session_rows_reduce_under_the_session_lane_and_are_never_drained(monkey
     class _Signer:
         identity = {"weights": "w", "width": 4}
         plans: dict = {}
+        dec = type("Dec", (), {"engine": object()})()  # an engine without compiled blocks: the eager session extend
 
         def why_not(self, rec):
             return None

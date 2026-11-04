@@ -66,6 +66,27 @@ def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor) -> 
         q.new_empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32)
 
 
+@torch.library.custom_op("kotodama::prefill_attend", mutates_args=())
+def _prefill_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    from flash_attn import flash_attn_with_kvcache
+
+    # one split: each query row reduces over its keys in one fixed order, whatever number of queries the call holds
+    return flash_attn_with_kvcache(q.contiguous(), k, v, cache_seqlens=lens, causal=True, num_splits=1)
+
+
+@_prefill_attend.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
+
+
+def prefill_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    """Causal attention of a block of S queries over a KV cache (flash-attn's KV-cache kernel, one split): query i
+    sits at position lens - S + i and attends keys < its position + 1. q (1, S, Hq, D), k/v (1, T, Hk, D) with a unit
+    last stride, lens (1,) int32. A row's output does not depend on how many queries the call holds or where the block
+    starts (one split fixes each row's reduction order), so a prompt prefilled in any chunking gets the same bytes."""
+    return torch.ops.kotodama.prefill_attend(q, k, v, lens)
+
+
 def attend_flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``attend_reference``'s contract on flash-attn's KV-cache kernel (CUDA, bf16/fp16, ``lens`` int32, keys and

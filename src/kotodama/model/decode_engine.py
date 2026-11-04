@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -47,8 +47,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from kotodama.model.gemv_kernels import decode_gemv, use_custom_gemv
 from kotodama.model.levers import LeverTables
 from kotodama.model.llama import KotodamaModel, apply_rope
-from kotodama.model.regional import (StepGraph, build_regions, cache_attend, check_norms, layer_signatures,
-                                     region_options, run_regions)
+from kotodama.model.regional import (StepGraph, block_attend, build_regions, cache_attend, check_norms,
+                                     layer_signatures, region_options, run_regions)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,7 @@ class DecodeEngine(nn.Module):
         steer_enabled: bool = False,
         levers: int = 0,
         emulate_casts: bool = False,
+        block_buckets: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
         if not model.config.attn_res:
@@ -219,6 +220,9 @@ class DecodeEngine(nn.Module):
             persistent=False,
         )
         self.register_buffer("pos", torch.zeros((1,), device=self.device, dtype=torch.long), persistent=False)
+        # The block row whose logits a block forward returns (its last row, unless the chunk is right-padded):
+        # read in-graph, set eagerly before each replay.
+        self.register_buffer("block_last", torch.zeros((1,), device=self.device, dtype=torch.long), persistent=False)
         self.register_buffer(
             "presence", torch.zeros((cfg.vocab_size,), device=self.device, dtype=torch.bool), persistent=False
         )
@@ -356,15 +360,23 @@ class DecodeEngine(nn.Module):
         # compiled callable — dynamo specializes a graph per static S. The
         # eager reference prefill measured FLAT ~23-26ms at T<=1024 (launch
         # bound); compiled blocks replace it and the 33-40ms MATH extend.
-        self.block_buckets: tuple[int, ...] = (256, 64, 16)
-        # Blocks attend the FULL max_seq_len cache under an additive mask
-        # (MATH-class SDPA in-graph), so their cost scales with chunk COUNT,
-        # not span — 1.4-1.6x faster than eager below
-        # ~768 tokens, 0.3-0.7x SLOWER above (eager gets causal flash within
-        # T). Spans above this route to the eager paths. (Future exact fix:
-        # rectangular-flash-to-prefix + causal-flash-within-chunk merged by
-        # logsumexp — kills both the mask and the full-cache read.)
-        self.block_span_max: int = 768
+        # Batch-invariant blocks (regional.block_attend: flash-attn's causal KV-cache kernel with one split, on CUDA
+        # in bf16/fp16): a position's KV and logits come out with the same bytes in any chunk, so every prompt and
+        # extend runs through the blocks (right-padded, never re-forwarding a cached position) and a cached prefix
+        # extends to exactly what a cold prefill writes. Their default is ONE bucket width: each width compiles its
+        # own kernels, and the row reductions of two widths can sum in different orders. Otherwise blocks attend
+        # the whole cache under an additive mask (SDPA), whose arithmetic depends on the chunk's width, and spans
+        # above block_span_max take the eager paths (faster there).
+        from kotodama.model.cascade_attn import flash_available
+
+        self.block_invariant: bool = (self.device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+                                      and flash_available())
+        default_buckets = (256,) if self.block_invariant else (256, 64, 16)
+        self.block_buckets: tuple[int, ...] = tuple(sorted({int(b) for b in (block_buckets or default_buckets)},
+                                                           reverse=True))
+        if not self.block_buckets or self.block_buckets[-1] < 1:
+            raise ValueError(f"block buckets {self.block_buckets} must be positive")
+        self.block_span_max: int = self.max_seq_len if self.block_invariant else 768
         # Extends (start > 0) of a span the buckets hold in one chunk take that one chunk, right-aligned (it
         # re-forwards up to bucket - span cached tokens), instead of the greedy cover: a block replay costs about the
         # same at any bucket width here, so one replay beats several. Off keeps the greedy cover; the prefix KV pool
@@ -489,19 +501,7 @@ class DecodeEngine(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        k_cache = self.k_caches[layer_idx]
-        v_cache = self.v_caches[layer_idx]
-        k_cache.index_copy_(2, positions, k)
-        v_cache.index_copy_(2, positions, v)
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k_cache,
-            v_cache,
-            attn_mask=bias,
-            enable_gqa=True,
-        )
-        out = out.transpose(1, 2).contiguous().view(1, S, -1)
+        out = block_attend(q, k, v, (self.k_caches[layer_idx], self.v_caches[layer_idx]), (bias, positions))
         return self._linear(out, attn.o_proj.weight)
 
     def _forward_block(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -589,9 +589,10 @@ class DecodeEngine(nn.Module):
         """A block's last-position logits (1, 1, V); advances pos by the block's length."""
         model = self.model
         S = partial.shape[1]
-        # Routing is per-position independent — only the last position's
-        # logits are consumed, so slice before the final route + lm_head.
-        last = [c[:, -1:] for c in committed] + [partial[:, -1:]]
+        # Routing is per-position independent — only one position's logits
+        # are consumed (block_last: the last real row), so slice before the
+        # final route + lm_head.
+        last = [c.index_select(1, self.block_last) for c in committed] + [partial.index_select(1, self.block_last)]
         x = self._route(last, model.final_res_query, model.final_res_norm.weight)
         x = model.norm(x)
         logits = self._linear(x, model.get_lm_head_weight())  # (1, 1, V)
@@ -903,7 +904,29 @@ class DecodeEngine(nn.Module):
         every chunk a compiled static shape). Returns None when the span (or
         prompt head, for the overlap) can't be covered — caller falls back
         to the eager reference path.
+
+        With batch-invariant blocks the plan never overlaps: greedy chunks,
+        the last RIGHT-PADDED to a bucket (``_run_chunks`` pads the ids; the
+        pad rows write KV past ``end``, masked until a later write replaces
+        it), so no cached position is re-forwarded and a prompt of any
+        length runs through the blocks.
         """
+        if self.block_invariant:
+            b_min = self.block_buckets[-1]
+            plan = []
+            i = start
+            while i < end:
+                b = next((B for B in self.block_buckets if B <= end - i), b_min)
+                plan.append((i, b))
+                i += b
+            if plan and plan[-1][0] + plan[-1][1] > self.max_seq_len:
+                # no room to pad at the cache's end: the last chunk right-aligned instead (one kernel per width, so
+                # the re-forwarded cached positions come out with the bytes they hold)
+                s0, b = plan[-1]
+                if end - b < 0:
+                    return None
+                plan[-1] = (end - b, b)
+            return plan or None
         if self.extend_single_chunk and start > 0:
             fit = [B for B in self.block_buckets if end - start <= B <= end]
             if fit:
@@ -934,10 +957,17 @@ class DecodeEngine(nn.Module):
         block = self._forward_block if eager else self._compiled_block
         assert block is not None
         end = input_ids.shape[1]
+        need = max(s + b for s, b in plan)
+        ids = input_ids.to(self.device)
+        if need > end:  # a right-padded last chunk (batch-invariant plans): its pad rows repeat the last id
+            ids = torch.cat([ids, ids[:, -1:].expand(1, need - end)], dim=1)
         logits = None
         for s, b in plan:
             self.pos.fill_(s)
-            logits = block(_graph_input(input_ids[:, s: s + b]))
+            self.block_last.fill_(min(b, end - s) - 1)
+            logits = block(_graph_input(ids[:, s: s + b]))
+        if need > end:
+            self.token_history[end:need].fill_(0)
         # Block graphs derive their bias in-graph; re-establish the decode
         # invariant on the persistent buffer: [0, end) open, rest closed.
         self.attn_bias.fill_(float("-inf"))
@@ -1087,7 +1117,8 @@ class DecodeEngine(nn.Module):
         return n if neq.numel() == 0 else int(neq[0, 0].item())
 
     @torch.inference_mode()
-    def prefill_cached(self, input_ids: torch.Tensor, slot: int = 0) -> tuple[torch.Tensor, dict]:
+    def prefill_cached(self, input_ids: torch.Tensor, slot: int = 0,
+                       prompt_kv_only: bool = False) -> tuple[torch.Tensor, dict]:
         """Prefill reusing any cached common prefix from the previous request.
 
         Token-exact match against token_history; on a hit, only the suffix is
@@ -1107,6 +1138,9 @@ class DecodeEngine(nn.Module):
         lever, or broadcast rows: its generated positions hold steered KV); a uniform lever's extend
         runs the block forward, which reads its slot. Inside a capture every
         prompt is a full eager prefill.
+
+        ``prompt_kv_only``: reuse only KV a prefill wrote (never a decode step's, whose kernels write other bytes):
+        with batch-invariant blocks the result is then exactly a cold prefill's.
 
         Returns (last-position logits (1, V) float32, info dict with
         prefix_hit / common_prefix / suffix_len for observability).
@@ -1128,6 +1162,8 @@ class DecodeEngine(nn.Module):
             common = 0  # the cached prompt KV was written under another lever
         if self._gen_steered:
             common = min(common, self._prefill_end)  # the decode steps after it wrote steered KV
+        if prompt_kv_only:
+            common = min(common, self.prompt_kv_len)
         if self._taps is not None:
             common = 0  # a capture taps every position: one eager prefill of the whole prompt
         if common < self.min_cached_prefix or (pslot and self._compiled_block is None):
@@ -1146,7 +1182,7 @@ class DecodeEngine(nn.Module):
         self.presence.zero_()
         self.attn_bias.fill_(float("-inf"))
 
-        if suffix_len == 1 and not self._steer_active:
+        if suffix_len == 1 and not self._steer_active and not self.block_invariant:
             # A 1-token extend IS a decode step (regenerate / undo-to-tip):
             # run it through the compiled step — no mask machinery, ~2.5ms.
             # Steering caveat: the compiled step injects steer_buf rows, but this
@@ -1249,6 +1285,26 @@ class DecodeEngine(nn.Module):
         return out["logits"][0, -1:].float(), {
             "prefix_hit": True, "common_prefix": common, "suffix_len": suffix_len,
         }
+
+    @torch.inference_mode()
+    def extend_padded(self, input_ids: torch.Tensor, start: int) -> torch.Tensor:
+        """Forward positions [start, S) of ``input_ids`` (1, S) over the KV the cache holds at [0, start), without
+        rewriting any of it: greedy bucket chunks from ``start``, the last one right-padded (its pad rows write KV
+        past S, which stays masked until a later write replaces it). The caller has set the cache's first ``start``
+        positions (and their token history); a KV session's turn extends this way. Batch-invariant blocks only (a
+        padded chunk's real rows then come out as in any other chunking). Returns the logits at position S - 1
+        (1, V) fp32; leaves the engine holding S positions, nothing of it reusable as prompt KV."""
+        if self._compiled_block is None or not self.block_invariant:
+            raise RuntimeError("extend_padded needs compiled, batch-invariant blocks")
+        end = input_ids.shape[1]
+        plan = self._chunk_plan(start, end) if 0 < start < end else None
+        if plan is None:
+            raise ValueError(f"extend_padded: positions [{start}, {end}) outside the cache ({self.max_seq_len})")
+        logits = self._run_chunks(input_ids, plan)
+        self.presence.zero_()
+        self.prompt_kv_len = 0
+        self._arm_decode_slot(0)
+        return logits
 
     @torch.inference_mode()
     def sample_first(self, prefill_logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
@@ -1437,7 +1493,7 @@ class DecodeEngine(nn.Module):
         self._block_regions, self._block_runs = {}, {}
         for b in self.block_buckets:
             self._block_regions[b], _ = build_regions(self, sigs, kvs, f"engine_block{b}_layer", steer=False,
-                                                      attend=cache_attend, linear=decode_linear, **block_opts)
+                                                      attend=block_attend, linear=decode_linear, **block_opts)
             if cuda_graph:
                 buf = torch.zeros((1, b), device=self.device, dtype=torch.long)
                 self._block_runs[b] = StepGraph(self._regional_block_forward, buf, pool)

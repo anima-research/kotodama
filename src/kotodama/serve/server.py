@@ -298,15 +298,27 @@ def _engine_prefill(input_ids: "torch.Tensor", slot: int = 0,
     ``slot``: the request's lever slot (--levers). A uniform lever's prompt KV is steered, so it bypasses the pool
     (keyed by tokens alone); the engine's own cached prefix is reused only under the same lever.
 
-    ``fresh``: a cold prefill whatever the caches hold. Seeded requests take it: a prefix hit forwards only the
-    suffix, through other kernels than a cold prefill, so the prompt's logits (and a seeded candidate's draws) would
-    otherwise depend on what the cache held when the request arrived.
+    ``fresh``: a prefill whose bytes must not depend on what the caches hold (seeded and signed requests). With
+    batch-invariant blocks (``DecodeEngine.block_invariant``) the caches still serve it, from prompt KV only: a
+    cached prefix extends to exactly what a cold prefill writes. Otherwise it is a cold prefill: a prefix hit would
+    forward only the suffix, through other kernels.
 
-    Returns (last-position logits, prefix-cache info dict or None).
+    Returns (last-position logits, prefix-cache info dict or None; ``invariant`` marks a cache read whose bytes equal a
+    cold prefill's).
     """
     assert _engine is not None
-    if fresh:
+    if fresh and not _engine.block_invariant:
         return _engine.prefill(input_ids, slot=slot), None
+    if fresh:
+        uniform = bool(slot) and _engine.levers is not None and _engine.levers.span(slot) == "uniform"
+        if _prefix_pool is not None and not uniform:
+            logits, info = _prefix_pool.prefill(input_ids, prompt_kv_only=True)
+            _engine._arm_decode_slot(slot)
+        elif _prefix_cache:
+            logits, info = _engine.prefill_cached(input_ids, slot=slot, prompt_kv_only=True)
+        else:
+            return _engine.prefill(input_ids, slot=slot), None
+        return logits, {**info, "invariant": True}
     uniform = bool(slot) and _engine.levers is not None and _engine.levers.span(slot) == "uniform"
     if _prefix_pool is not None and not uniform:
         out = _prefix_pool.prefill(input_ids)
@@ -388,7 +400,7 @@ def _load_checkpoint(checkpoint_path: Path | str) -> Any:
     return ckpt.load(checkpoint_path)
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, emulate_casts: bool = False) -> tuple[KotodamaModel, AutoTokenizer]:
+def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", model_size: str = "3b", engine: str = "fast", prefix_cache: bool = False, warmup_sdpa: bool = False, steer_npz: str | None = None, max_seq_len: int | None = None, multi_rows: tuple[int, ...] = (), xbatch_rows: tuple[int, ...] = (), xbatch_refill: bool = False, prefix_pool_tokens: int = 0, prefix_pool_block: int = 16, cascade_attn: bool = False, cascade_groups: int = 0, cascade_tail_tokens: int = 1024, levers: int = 0, seeded_rows: bool = False, compile_store: str | None = None, compile_mode: str = "max-autotune", warm_truncated: bool = True, regional: bool = False, autotune_min_rows: int = 0, emulate_casts: bool = False, prefill_buckets: tuple[int, ...] = ()) -> tuple[KotodamaModel, AutoTokenizer]:
     global _device, _serve_mode, _stop_token_ids, _engine, _prefix_cache, _max_seq_len, _multi, _xbatch, _prefix_pool
     global _row_token_cap, _cascade_info, _levers, _seeded_rows, _compile_mode, _warm_truncated, _regional
     global _compile_store_state, _autotune_min_rows
@@ -509,6 +521,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             "autotune_min_rows": int(autotune_min_rows),
             # present only when on, so the stores of servers without it keep their keys
             **({"emulate_casts": True} if emulate_casts else {}),
+            **({"prefill_buckets": sorted(prefill_buckets, reverse=True)} if prefill_buckets else {}),
         })
         store_key = compile_cache.cache_key(store_fields)
         store_hit, store_claim = compile_cache.acquire(compile_store, store_key)
@@ -526,7 +539,7 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
             # graphs.
             # --levers: per-request lever tables replace the broadcast rows (banks resolve into levers).
             eng = DecodeEngine(model, max_seq_len=_max_seq_len, steer_enabled=steer_npz is not None and not levers,
-                               levers=levers, emulate_casts=emulate_casts)
+                               levers=levers, emulate_casts=emulate_casts, block_buckets=prefill_buckets or None)
             global _regional
             if _regional:
                 try:
@@ -1587,6 +1600,7 @@ _warmup_sdpa_arg = False
 _steer_npz_arg: str | None = None
 _multi_rows_arg: tuple[int, ...] = ()
 _xbatch_rows_arg: tuple[int, ...] = ()
+_prefill_buckets_arg: tuple[int, ...] = ()
 _xbatch_refill_arg = False
 _prefix_pool_tokens_arg = 0
 _prefix_pool_block_arg = 16
@@ -1671,6 +1685,7 @@ async def lifespan(app: FastAPI):
         max_seq_len=_max_seq_len_arg,
         multi_rows=_multi_rows_arg,
         xbatch_rows=_xbatch_rows_arg,
+        prefill_buckets=_prefill_buckets_arg,
         xbatch_refill=_xbatch_refill_arg,
         prefix_pool_tokens=_prefix_pool_tokens_arg,
         prefix_pool_block=_prefix_pool_block_arg,
@@ -2639,9 +2654,9 @@ async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
 def _sign_reduce_batch(take: list) -> None:
     """One batch of pending in-flight rows (see _sign_flush): reduced and written, or queued in _sign_unwritten
     while another drain holds the spool. A KV session's rows reduce apart from the others, under the session lane's
-    identity (kotodama.serve.kv_sessions.SESSION_IDENTITY); one that was not captured is counted unsigned, never
+    identity (kotodama.serve.kv_sessions.session_identity); one that was not captured is counted unsigned, never
     spooled for the drain (no cold replay of its ids reproduces its KV)."""
-    from kotodama.serve.kv_sessions import SESSION_IDENTITY
+    from kotodama.serve.kv_sessions import session_identity
 
     session = ["cache_state" in rec.meta for rec, _, _ in take]
     for (rec, row, _), sess in zip(take, session):
@@ -2656,7 +2671,7 @@ def _sign_reduce_batch(take: list) -> None:
     cold = [t for t, d, sess in zip(take, drainable, session) if not d and not sess]
     sessioned = [t for t, sess in zip(take, session) if sess and t[1] is not None]
     del take
-    for group, extra in ((cold, None), (sessioned, SESSION_IDENTITY)):
+    for group, extra in ((cold, None), (sessioned, session_identity(_signer.dec.engine))):
         if not group:
             continue
         identity = _signer.identity if extra is None else {**_signer.identity, **extra}
@@ -3339,6 +3354,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "config decode together, each filled from its own prefill, on the narrowest bucket that "
                              "holds their rows. All buckets (and --multi_rows) share the widest one's KV memory. "
                              "Empty = off")
+    parser.add_argument("--prefill_buckets", default="",
+                        help="The compiled prefill chunk widths, comma tokens, e.g. 1024,256,64,16 (default "
+                             "256,64,16). With batch-invariant blocks (CUDA, flash-attn) every prompt runs through "
+                             "them, so wider buckets prefill long prompts in fewer chunks; each costs a compile")
     parser.add_argument("--xbatch_refill", action=argparse.BooleanOptionalAction, default=False,
                         help="With --xbatch_rows: refill rows freed by finished requests from the queue between "
                              "decode steps (continuous batching) instead of waiting for the batch's longest row")
@@ -3513,6 +3532,12 @@ if __name__ == "__main__":
         parser.error(f"--xbatch_rows: comma-separated ints, got {args.xbatch_rows!r}")
     if any(r < 2 for r in _xbatch_rows_arg):
         parser.error("--xbatch_rows buckets must be >= 2")
+    try:
+        _prefill_buckets_arg = tuple(int(x) for x in args.prefill_buckets.split(",") if x.strip())
+    except ValueError:
+        parser.error(f"--prefill_buckets: comma-separated ints, got {args.prefill_buckets!r}")
+    if any(b < 1 for b in _prefill_buckets_arg):
+        parser.error("--prefill_buckets must be >= 1")
     if _xbatch_rows_arg and _engine_arg != "fast":
         parser.error("--xbatch_rows requires --engine fast")
     if args.xbatch_refill and not _xbatch_rows_arg:

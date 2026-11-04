@@ -4,8 +4,8 @@ Without a session every request re-prefills its whole prompt, so the model alway
 window. A session keeps the KV the conversation actually lived instead:
 
   * a turn sends only its new tokens (``kv_session`` on /v1/completions or /generate). The server prefills them
-    against the session's KV (an eager extend: every earlier position's KV is read as the session holds it, never
-    rewritten), decodes the turn's n candidates, and keeps each candidate's decode-written KV until the next turn;
+    against the session's KV (every earlier position's KV is read as the session holds it, never rewritten: through
+    the compiled blocks, right-padded, on a batch-invariant engine, else an eager extend), decodes the turn's n candidates, and keeps each candidate's decode-written KV until the next turn;
   * the next turn names the candidate the conversation continues with (``append_from``, or the session append endpoint):
     its generated tokens join the session with the KV their decode steps wrote. A token whose position no step fed
     (a candidate's last token, when no stop token followed it) is prefilled with the next turn;
@@ -249,6 +249,19 @@ def prefill(engine: Any, s: KVSession, new_ids: list[int], append_from: Optional
     dev = engine.device
     if n == 0:
         logits = engine.prefill(torch.tensor([full], dtype=torch.long, device=dev))
+    elif extends_by_blocks(engine, p):
+        # the compiled blocks, right-padded (kotodama.model.decode_engine.DecodeEngine.extend_padded): no earlier
+        # position is re-forwarded, and every position comes out as in any chunking
+        for li in range(engine.n_layers):
+            engine.k_caches[li][0, :, :n].copy_(s.k[li])
+            engine.v_caches[li][0, :, :n].copy_(s.v[li])
+        engine.token_history[:n].copy_(torch.tensor(full[:n], dtype=torch.long, device=dev))
+        logits = engine.extend_padded(torch.tensor([full], dtype=torch.long, device=dev), n)
+        if not bool(torch.stack([torch.stack([c[0, :, n:p].isfinite().all() for c in engine.k_caches]).all(),
+                                 torch.stack([c[0, :, n:p].isfinite().all() for c in engine.v_caches]).all()]).all()):
+            engine.reset()
+            raise SessionError(f"session {s.id!r}: the turn's prefill wrote non-finite KV; the session is unchanged",
+                               409)
     else:
         for li in range(engine.n_layers):
             engine.k_caches[li][0, :, :n].copy_(s.k[li])
@@ -284,6 +297,19 @@ def prefill(engine: Any, s: KVSession, new_ids: list[int], append_from: Optional
     s.ids, s.unfed, s.pending = full, [], {}
     s.turns += 1
     return logits, {"session": s.id, "session_tokens": n, "prefilled_tokens": p - n}
+
+
+def extends_by_blocks(engine: Any, end: int) -> bool:
+    """Whether a turn ending at position ``end`` extends through the engine's compiled, batch-invariant blocks
+    (else an eager extend)."""
+    return (getattr(engine, "_compiled_block", None) is not None and getattr(engine, "block_invariant", False)
+            and end + engine.block_buckets[-1] <= engine.max_seq_len)
+
+
+def session_identity(engine: Any) -> dict[str, str]:
+    """SESSION_IDENTITY plus how this engine extends a turn (the extend's kernels decide the new positions' bytes)."""
+    blocks = getattr(engine, "_compiled_block", None) is not None and getattr(engine, "block_invariant", False)
+    return {**SESSION_IDENTITY, "session_extend": "padded-blocks" if blocks else "eager"}
 
 
 @torch.inference_mode()

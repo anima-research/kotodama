@@ -37,8 +37,8 @@ seeded_rows: true
 emulate_casts: true
 # Every generation is signed (a request's `sign: false` opts out, counted in /info): in flight where the batcher
 # decodes it (the row buckets then compile without kernel benchmarking, so signed and unsigned requests decode the
-# same tokens; a signed request prefills cold, past the prefix pool, since pooled KV has other bytes), otherwise by
-# the idle drain from its record. The spool and the reducer are the site's
+# same tokens; the prefill blocks are batch-invariant, so a signed request's prefix pool hit writes the bytes a cold
+# prefill does), otherwise by the idle drain from its record. The spool and the reducer are the site's
 # (KOTODAMA_SIGN_SPOOL, KOTODAMA_SIGN_REDUCER, KOTODAMA_SIGN_REDUCER_KWARGS in site.env); a server without them
 # refuses to start (--no-sign_default serves unsigned).
 sign_default: true
