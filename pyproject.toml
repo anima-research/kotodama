@@ -50,6 +50,11 @@ nca = [
     "einops",
 ]
 
+# Curation: compressed (.jsonl.zst) chunks in kotodama.data.curation; plain .jsonl needs nothing extra
+curation = [
+    "zstandard",
+]
+
 # Tests: the CPU suite runs across all cores (pytest-xdist; `-n 0` runs it serially)
 dev = [
     "pytest",
@@ -58,7 +63,7 @@ dev = [
 
 # Everything
 all = [
-    "kotodama[training,eval,nca]",
+    "kotodama[training,eval,nca,curation]",
 ]
 
 [tool.uv]

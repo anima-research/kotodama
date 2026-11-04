@@ -8,7 +8,8 @@ training, each rank gets a non-overlapping partition of the data.
 Data format:
     Flat binary file of np.uint16 token IDs (2 bytes per token).
     EOS token (id=0) separates documents within the stream.
-    Create with scripts/utils/tokenize_data.py.
+    Built by kotodama.data.curation (tokenize, then assemble);
+    kotodama.data.stream inspects, samples and remixes one.
 """
 
 from __future__ import annotations
