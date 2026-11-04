@@ -105,6 +105,20 @@ single-process job inside the launcher environment.
 | NCA token stream (3B recipe) | `tools/nca_gen.sh` (defaults: 3500 rules × 20 sims, seed 17; split into train/eval and verified) |
 | NCA v3 stream + eval sets | `python -m kotodama.nca.gen_dyadic_data --out <dir> ...` (token-level mix, banded rules, per-episode sidecar), then `--finalize --out <dir>` to concatenate and emit the eval sets |
 | repeated-bigram statistics | `python scripts/utils/bigram_stats.py name=<stream.bin> [...] --out <json>` (in-context repeated-bigram opportunity and reliability over uint16 streams) |
+| curate: ingest a source | `python -m kotodama.data.curation.ingest {--preset <name> \| --hf <id> --name <src> \| --local <path> --name <src> \| --spec <src.yaml>} --out_dir <cleaned>` (cleaning, quality filters, chunked JSONL, per-reason stats; `--list_presets`; `--adapter module:function` for a site-local source) |
+| curate: deduplicate | `python -m kotodama.data.curation.dedup --in_dir <cleaned> --out_dir <deduped> [--mode minhash\|exact] [--priority <src>=N ...]` (across sources; the higher-priority copy survives) |
+| curate: tokenize | `python -m kotodama.data.curation.tokenize --in_dir <deduped> --out_dir <tokenized>` (one uint16 `<src>.bin` per source, EOS after each document) |
+| curate: assemble | `python -m kotodama.data.curation.assemble --in_dir <tokenized> --out <train.bin> --seq_len 4096 [--drop <src>] [--weight <src>=W] [--cap <src>=TOKENS]` (shuffled in `seq_len` chunks; `train.provenance.json` names every chunk's source) |
+| curate: audit a source | `python -m kotodama.data.curation.audit --in_dir <chunks> --source <src> --class <web\|prose\|code\|...> --out_dir <dir>` (what the filters would drop or repair, with exemplars) |
+| inspect / sample / remix a stream | `python -m kotodama.data.stream {inspect,sample,remix} <train.bin> ...` (size, documents and source shares; decoded chunks by source; a new stream with sources dropped or reweighted, and its own provenance) |
+
+The curation stages run in order, and each stage reads the directory that the
+previous stage wrote. A stage writes every file under a temporary name and
+renames it when complete. A source or chunk that is already finished is skipped
+on a rerun. The provenance file beside an assembled stream records the order of
+its sources, their chunk counts and the shuffle seed. That record is enough to
+label every chunk of the stream with its source (`kotodama.data.provenance`).
+`.jsonl.zst` chunks need the `curation` extra.
 
 ### Train
 
@@ -403,7 +417,8 @@ src/kotodama/
                decode_engine, capture, init_schemes, routing_read
   nca/         NCA trajectory generator, dyadic variant, v3 dataset writer
   training/    train.py, Muon, checkpointing, inloop (in-loop evals)
-  data/        uint16 token-stream dataset
+  data/        uint16 token-stream dataset, provenance, stream (inspect / sample / remix),
+               curation/ (ingest, clean, filters, dedup, tokenize, assemble, audit)
   eval/        model loading, lm-eval adapter, uncheatable, induction, nca_gates,
                riders/ (rider grid), bindprobes/ (binding probes), binding/ (the suite: one runner + scorecard)
   monitoring/  per-layer geometric telemetry, wandb callback
