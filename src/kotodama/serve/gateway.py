@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -290,6 +291,8 @@ class Fleet:
         self.replicas: list[Replica] = []
         self.by_pool: dict[str, list[Replica]] = {}
         self.name_to_pool: dict[str, str] = {m.served_model_name: m.key for m in cfg.models}
+        # open KV sessions -> the replica holding each (a session lives on one replica; it never moves)
+        self.sessions: dict[str, "Replica"] = {}
         self.global_inflight = 0
         self._build()
 
@@ -673,8 +676,15 @@ async def _proxy(request: Request, endpoint: str, path: str) -> Response:
         logger.warning("503 %s pool=%s | overloaded (inflight=%d)", path, pool, _fleet.global_inflight)
         return JSONResponse(status_code=503, content={"error": "gateway overloaded, retry shortly"})
 
+    sid = body.get("kv_session") if isinstance(body, dict) else None
     akey = _affinity_key(body)
-    replica, route_mode = _fleet.pick(pool, akey)
+    if sid is not None:  # a KV session's turn goes to the replica holding the session, or nowhere
+        replica, err = _session_replica(str(sid))
+        if replica is None:
+            return err
+        route_mode = "session"
+    else:
+        replica, route_mode = _fleet.pick(pool, akey)
     if replica is None:
         logger.warning("503 %s pool=%s | no healthy replica", path, pool)
         return JSONResponse(status_code=503, content={"error": f"no healthy '{pool}' replica available"})
@@ -698,6 +708,9 @@ async def _proxy(request: Request, endpoint: str, path: str) -> Response:
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
             logger.warning("%s transport error (%s); marking unhealthy + failover", replica.tag, exc)
             replica.healthy = False
+            if sid is not None:  # a session's KV is on that replica: no other replica can serve its turn
+                return JSONResponse(status_code=502, content={"error": f"backend error on the replica holding "
+                                                                       f"session {sid!r}: {exc}"})
             _fleet.release(replica)
             # Re-pick with the same key: rendezvous skips the now-unhealthy
             # replica and gives this conversation a stable new home.
@@ -767,6 +780,84 @@ async def score_tokens(request: Request):
 @app.post("/logprobs")
 async def logprobs(request: Request):
     return await _proxy(request, endpoint="completion", path="/logprobs")
+
+
+def _session_replica(sid: str) -> tuple[Optional["Replica"], Optional[JSONResponse]]:
+    replica = _fleet.sessions.get(sid)
+    if replica is None:
+        return None, JSONResponse(status_code=404, content={"error": f"no open KV session {sid!r} on this fleet"})
+    if not replica.healthy:
+        return None, JSONResponse(status_code=410, content={"error": f"the replica holding KV session {sid!r} is "
+                                                                     "down; the session is lost"})
+    return replica, None
+
+
+async def _forward_session(replica: "Replica", method: str, path: str, **kw: Any) -> Response:
+    _fleet.acquire(replica)
+    try:
+        resp = await _http.request(method, f"{replica.url}{path}", **kw)
+    except Exception as exc:
+        logger.warning("502 %s -> %s | %s", path, replica.tag, exc)
+        return JSONResponse(status_code=502, content={"error": f"backend error: {exc}"})
+    finally:
+        _fleet.release(replica)
+    return Response(content=resp.content, status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "application/json"))
+
+
+@app.post("/kv_session/open")
+async def kv_session_open(request: Request):
+    """Open a KV session on one replica of the pool the body's ``model`` names (else the completion pool), the
+    least loaded; every later request of the session goes to that replica."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    pool = _fleet.resolve_pool("completion", body if isinstance(body, dict) else {})
+    replica, _ = _fleet.pick(pool, None)
+    if replica is None:
+        return JSONResponse(status_code=503, content={"error": f"no healthy '{pool}' replica available"})
+    payload = {k: v for k, v in (body or {}).items() if k != "model"} if isinstance(body, dict) else {}
+    resp = await _forward_session(replica, "POST", "/kv_session/open", json=payload)
+    if resp.status_code == 200:
+        sid = json.loads(resp.body)["session"]
+        _fleet.sessions[sid] = replica
+        logger.info("kv session %s opened on %s", sid, replica.tag)
+    return resp
+
+
+@app.post("/kv_session/{op}")
+async def kv_session_op(op: str, request: Request):
+    """close, append, evict, export, import: forwarded to the replica holding the session (``session`` in the JSON
+    body, or in the query for import, whose body is an export's bytes)."""
+    if op not in ("close", "append", "evict", "export", "import"):
+        return JSONResponse(status_code=404, content={"error": f"no KV session op {op!r}"})
+    if op == "import":
+        sid = request.query_params.get("session", "")
+        kw: dict[str, Any] = {"content": await request.body(), "params": dict(request.query_params),
+                              "headers": {"content-type": "application/octet-stream"}}
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "invalid JSON body"})
+        sid = str(body.get("session", "")) if isinstance(body, dict) else ""
+        kw = {"json": body}
+    replica, err = _session_replica(sid)
+    if replica is None:
+        return err
+    resp = await _forward_session(replica, "POST", f"/kv_session/{op}", **kw)
+    if op == "close" and resp.status_code in (200, 404):
+        _fleet.sessions.pop(sid, None)
+    return resp
+
+
+@app.get("/kv_session/{sid}")
+async def kv_session_info(sid: str):
+    replica, err = _session_replica(sid)
+    if replica is None:
+        return err
+    return await _forward_session(replica, "GET", f"/kv_session/{sid}")
 
 
 @app.get("/info")

@@ -256,7 +256,8 @@ _sign_stats: dict[str, Any] = {"records": 0, "batches": 0, "signed": 0, "skipped
 # the generation thread in batches of the signer's width (between steps once that many wait, else when idle) and
 # written to the spool as signed batches. (record, captured span or None, lever plan or None) per candidate:
 _sign_pending: list[tuple[Any, Any, Any]] = []
-_sign_unwritten: list[tuple[list, list]] = []  # reduced batches (results, plans) the spool's drain lock held off
+# reduced batches (results, plans, identity) the spool's drain lock held off
+_sign_unwritten: list[tuple[list, list | None, dict]] = []
 _sign_pending_lock = threading.Lock()
 _sign_reducing = 0  # rows taken from _sign_pending and not yet reduced
 _sign_timing: dict[str, float] = {"reduce_s": 0.0, "write_s": 0.0}  # in-flight batches, seconds in each part
@@ -755,6 +756,10 @@ class GenerateRequest(BaseModel):
     # None: the server's default (--sign_default); False opts out.
     sign: bool | None = None
     sign_meta: dict[str, Any] | None = None
+    # A KV session's turn (--kv_sessions): the prompt is the turn's new tokens only, prefilled against the session's
+    # KV; ``append_from`` first joins that candidate of the session's last turn (kotodama.serve.kv_sessions).
+    kv_session: str | None = None
+    append_from: int | None = Field(default=None, ge=0)
 
 
 class GenerateResponse(BaseModel):
@@ -793,6 +798,7 @@ class ModelInfo(BaseModel):
     sign: dict | None = None
     kernel_pins: dict | None = None
     request_log: dict | None = None  # --request_log: its dir, writer and row counts
+    kv_sessions: dict | None = None  # --kv_sessions: the open sessions, their lengths and cache states
     memory: dict | None = None
 
 
@@ -1616,6 +1622,10 @@ _request_log_weights: str | None = None
 # the candidates a request produced (their exact ids, stop and sign ids), gathered for its log row
 _logged_candidates: contextvars.ContextVar[list | None] = contextvars.ContextVar("logged_candidates", default=None)
 _sign_engine_digest: str | None = None  # sha256 of the signer's engine identity at startup (records' meta)
+# KV sessions (--kv_sessions, kotodama.serve.kv_sessions): conversations whose KV lives across their requests
+_kv_sessions_arg = 0
+_kv_session_idle_s_arg = 3600.0
+_kv_sessions: "Any" = None
 
 
 def attnres_routing() -> dict[str, Any]:
@@ -1678,6 +1688,7 @@ async def lifespan(app: FastAPI):
     )
     sign_task = _start_signing()
     _open_request_log()
+    _open_kv_sessions()
     if _pins is not None and _pins.mode == "record":
         logger.info("kernel pins recorded: %s (%d kernels, %s)", _pins.save(), len(_pins.table), _pins.digest[:12])
     elif _pins is not None and _pins.misses:
@@ -1696,6 +1707,18 @@ async def lifespan(app: FastAPI):
         if _request_log is not None:
             _request_log.close()
         _generate_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _open_kv_sessions() -> None:
+    global _kv_sessions
+    if _kv_sessions_arg > 0 and _engine is not None and _xbatch is not None:
+        from kotodama.serve.kv_sessions import SessionStore
+
+        _kv_sessions = SessionStore(_kv_sessions_arg, idle_s=_kv_session_idle_s_arg)
+        logger.info("KV sessions ENABLED: up to %d, closed after %.0f s idle when room is needed", _kv_sessions_arg,
+                    _kv_session_idle_s_arg)
+    elif _kv_sessions_arg > 0:
+        logger.warning("--kv_sessions needs the fast engine with --xbatch_rows; KV sessions are off")
 
 
 def _open_request_log() -> None:
@@ -1978,6 +2001,7 @@ async def info():
         startup=_startup_info,
         sign=_sign_info(),
         request_log=_request_log.info() if _request_log is not None else None,
+        kv_sessions=_kv_sessions.info() if _kv_sessions is not None else None,
         kernel_pins=None if _pins is None else {"mode": _pins.mode, "path": str(_pins.path), "kernels": len(_pins.table),
                                                 "hits": _pins.hits, "recorded": _pins.recorded,
                                                 "misses": len(_pins.misses), "digest": _pins.digest},
@@ -2087,7 +2111,7 @@ def _sign_waiting(sign_id: str) -> bool:
     with _sign_pending_lock:
         if any(rec.request_id == sign_id for rec, _, _ in _sign_pending):
             return True
-    return any(res.record.request_id == sign_id for results, _ in _sign_unwritten for res in results)
+    return any(res.record.request_id == sign_id for results, _, _ in _sign_unwritten for res in results)
 
 
 @app.post("/replay")
@@ -2105,6 +2129,9 @@ async def replay_endpoint(request: ReplayRequest):
                                  "waiting to be reduced)")
     if rec is None:
         raise HTTPException(404, f"no record {request.sign_id!r} in this server's spool")
+    if "cache_state" in rec.meta:
+        raise HTTPException(409, f"{request.sign_id} is a KV session's row: its KV was the session's, which no replay "
+                                 "of its ids reproduces (meta.cache_state names its condition)")
     if row is None or "file" not in row:
         why = (row or {}).get("skipped") or "not signed yet (the drain has not reached it)"
         raise HTTPException(409, f"{request.sign_id} has no signed row: {why}")
@@ -2145,7 +2172,7 @@ async def generate_endpoint(request: GenerateRequest, http_request: Request):
     _refuse_unserved(request)
     request = _resolve_sign(request)
 
-    if request.seed is not None or (request.sign and not request.stream):
+    if request.kv_session is not None or request.seed is not None or (request.sign and not request.stream):
         if request.stream:
             raise HTTPException(400, "a seeded request cannot stream")
         out = await _batched_candidates(request, 1)
@@ -2242,6 +2269,9 @@ class OAICompletionRequest(BaseModel):
     # server's default (--sign_default); False opts out.
     sign: bool | None = None
     sign_meta: dict[str, Any] | None = None
+    # A KV session's turn, as on /generate.
+    kv_session: str | None = None
+    append_from: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -2379,15 +2409,25 @@ def _xbatch_key(request: GenerateRequest, steered: bool) -> tuple:
     return (steer,)
 
 
-async def engine_generate_xbatch(request: GenerateRequest, n: int,
-                                 signed_out: list | None = None) -> list[GenerateResponse]:
+async def engine_generate_xbatch(request: GenerateRequest, n: int, signed_out: list | None = None,
+                                 session: "tuple[Any, list[int]] | None" = None,
+                                 kv_out: list | None = None) -> list[GenerateResponse]:
     """n candidates of one prompt through the cross-request batcher: same tokenization, steering, stop and capacity
     rules as engine_generate per candidate. Bad prompts and steering stacks 400 before the request queues.
     ``signed_out`` (in-flight signing): the job decodes on the signing decoder and the list receives each
-    candidate's captured span."""
+    candidate's captured span. ``session`` (a KV session's turn: the session and the turn's new ids): the job prefills
+    against the session and ``kv_out`` receives each candidate's decode-written KV."""
     assert _xbatch is not None and _tokenizer is not None
     t0 = time.perf_counter()
-    prompt_ids = _prompt_ids(request, _tokenizer)
+    job_prefill = None
+    if session is not None:
+        from kotodama.serve import kv_sessions
+
+        sess, new_ids = session
+        prompt_ids, _ = kv_sessions.turn_ids(sess, new_ids, request.append_from)
+        job_prefill = functools.partial(kv_sessions.prefill, _engine, sess, new_ids, request.append_from)
+    else:
+        prompt_ids = _prompt_ids(request, _tokenizer)
     if len(prompt_ids) >= _max_seq_len:
         raise HTTPException(400, f"Prompt too long: {len(prompt_ids)} tokens (max {_max_seq_len})")
     _check_span(request)
@@ -2399,10 +2439,15 @@ async def engine_generate_xbatch(request: GenerateRequest, n: int,
     job = XBatchJob(key=_xbatch_key(request, steered), prompt_ids=prompt_ids, n=n,
                     max_new_tokens=request.max_new_tokens, params=params, done=lambda _outcome: None,
                     stop_strings=tuple(request.stop_strings), steer_writes=steer_writes, steer_kwargs=steer_kwargs,
-                    lever=lever, seed=request.seed, sign=signed_out is not None)
+                    lever=lever, seed=request.seed, sign=signed_out is not None, prefill=job_prefill,
+                    admitted=(functools.partial(kv_sessions.poison, _engine, session[0].id)
+                              if session is not None else None),
+                    keep_kv=session is not None)
     result = await _xbatch.submit(job)
     if signed_out is not None:
         signed_out.extend(result.signed)
+    if kv_out is not None:
+        kv_out.extend(result.kv)
     elapsed = time.perf_counter() - t0
     timing = dict(result.timing)
     if steered:
@@ -2464,7 +2509,8 @@ def _spool_records(request: GenerateRequest, responses: list[GenerateResponse]) 
     _sign_stats["records"] += len(records)
 
 
-def _sign_records(request: GenerateRequest, responses: list[GenerateResponse]) -> tuple[list, "Any"]:
+def _sign_records(request: GenerateRequest, responses: list[GenerateResponse],
+                  cache_state: dict | None = None) -> tuple[list, "Any"]:
     """One sign record per candidate (kotodama.model.signer.SignRecord), and the request's lever plan (None:
     unsteered); each response gets its sign_id. The generated ids end with the stop token that ended the candidate,
     if one did: its position was fed."""
@@ -2484,14 +2530,17 @@ def _sign_records(request: GenerateRequest, responses: list[GenerateResponse]) -
                                   meta={**(request.sign_meta or {}), "candidate": i, "seed": request.seed,
                                         "law": law, "served_by": _sign_writer, **_sign_provenance(),
                                         # prompt tokens whose KV the prefill took from a prefix cache or pool
-                                        "prefix_reused": int((resp.timing or {}).get("prefix_common_tokens", 0))}))
+                                        "prefix_reused": int((resp.timing or {}).get("prefix_common_tokens", 0)),
+                                        # a KV session's row: the session's condition (kotodama.serve.kv_sessions)
+                                        **({"cache_state": cache_state} if cache_state is not None else {})}))
     return records, plan
 
 
-def _sign_add_inflight(request: GenerateRequest, responses: list[GenerateResponse], signed: list) -> None:
+def _sign_add_inflight(request: GenerateRequest, responses: list[GenerateResponse], signed: list,
+                       cache_state: dict | None = None) -> None:
     """A signed request's records (as _spool_records names them) and its candidates' captured spans, queued for
-    the in-flight reduce."""
-    records, plan = _sign_records(request, responses)
+    the in-flight reduce. ``cache_state``: a KV session's turn (its rows are signed in flight or not at all)."""
+    records, plan = _sign_records(request, responses, cache_state=cache_state)
     if len(signed) != len(records):
         signed = [None] * len(records)
     # a prefill that reused cached KV exports no span (kotodama.serve.xbatch): the drain signs those records cold
@@ -2519,8 +2568,8 @@ def _sign_flush(full_only: bool = False) -> None:
     global _sign_reducing
     assert _signer is not None and _sign_spool is not None
     while _sign_unwritten:
-        results, plans = _sign_unwritten[0]
-        summary = _sign_spool.add_signed(_sign_writer, results, _signer.identity, plans=plans)
+        results, plans, identity = _sign_unwritten[0]
+        summary = _sign_spool.add_signed(_sign_writer, results, identity, plans=plans)
         if summary is None:
             return
         _sign_unwritten.pop(0)
@@ -2552,7 +2601,7 @@ async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
     logged."""
     if _signer is None or _sign_spool is None or not (_sign_pending or _sign_reducing or _sign_unwritten):
         return
-    waiting = len(_sign_pending) + _sign_reducing + sum(len(r) for r, _ in _sign_unwritten)
+    waiting = len(_sign_pending) + _sign_reducing + sum(len(r) for r, _, _ in _sign_unwritten)
 
     async def flush() -> None:
         async with _engine_lock:
@@ -2566,7 +2615,10 @@ async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
     with _sign_pending_lock:
         left = list(_sign_pending)
         del _sign_pending[:]
-    records = [(rec, plan) for rec, _, plan in left if _signer.why_not(rec) is None]
+    for rec, _, _ in left:
+        if "cache_state" in rec.meta:
+            _count_session_unsigned(rec, "pending at shutdown")
+    records = [(rec, plan) for rec, _, plan in left if "cache_state" not in rec.meta and _signer.why_not(rec) is None]
     if records:
         try:
             _sign_spool.add(_sign_writer, [rec for rec, _ in records],
@@ -2575,7 +2627,7 @@ async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
             logger.exception("sign: %d in-flight records could not be written to the spool at shutdown", len(records))
             records = []
     # rows still being reduced or held off by another drain's lock when the server exits are not written
-    unfinished = _sign_reducing + sum(len(r) for r, _ in _sign_unwritten)
+    unfinished = _sign_reducing + sum(len(r) for r, _, _ in _sign_unwritten)
     lost = len(left) - len(records) + unfinished
     if lost:
         _sign_stats["errors"] += 1
@@ -2586,33 +2638,63 @@ async def _sign_flush_at_shutdown(timeout: float = _SIGN_SHUTDOWN_S) -> None:
 
 def _sign_reduce_batch(take: list) -> None:
     """One batch of pending in-flight rows (see _sign_flush): reduced and written, or queued in _sign_unwritten
-    while another drain holds the spool."""
-    drainable = [row is None and _signer.why_not(rec) is None for rec, row, _ in take]
+    while another drain holds the spool. A KV session's rows reduce apart from the others, under the session lane's
+    identity (kotodama.serve.kv_sessions.SESSION_IDENTITY); one that was not captured is counted unsigned, never
+    spooled for the drain (no cold replay of its ids reproduces its KV)."""
+    from kotodama.serve.kv_sessions import SESSION_IDENTITY
+
+    session = ["cache_state" in rec.meta for rec, _, _ in take]
+    for (rec, row, _), sess in zip(take, session):
+        if sess and row is None:
+            _count_session_unsigned(rec, "its span was not captured")
+    drainable = [row is None and not sess and _signer.why_not(rec) is None
+                 for (rec, row, _), sess in zip(take, session)]
     to_drain = [(rec, plan) for (rec, _, plan), d in zip(take, drainable) if d]
     if to_drain:
         _sign_spool.add(_sign_writer, [rec for rec, _ in to_drain],
                         plans=list({p.digest(): p for _, p in to_drain if p is not None}.values()) or None)
-    take = [t for t, d in zip(take, drainable) if not d]
-    if not take:
-        return
-    plans = list({p.digest(): p for _, _, p in take if p is not None}.values())
-    _signer.plans.update({p.digest(): p for p in plans})
-    t0 = time.perf_counter()
-    results = _signer.sign_captured([rec for rec, _, _ in take], [row for _, row, _ in take])
+    cold = [t for t, d, sess in zip(take, drainable, session) if not d and not sess]
+    sessioned = [t for t, sess in zip(take, session) if sess and t[1] is not None]
     del take
-    t1 = time.perf_counter()
-    summary = _sign_spool.add_signed(_sign_writer, results, _signer.identity, plans=plans or None)
-    t2 = time.perf_counter()
-    _sign_timing["reduce_s"] += t1 - t0
-    _sign_timing["write_s"] += t2 - t1
-    if summary is None:
-        _sign_unwritten.append((results, plans or None))
-        logger.info("sign: in-flight batch of %d rows reduced; the spool's drain lock is held, written later",
-                    len(results))
-        return
-    _sign_count(summary)
-    logger.info("sign: in-flight batch %s: %d signed, %d skipped in %.2fs (reduce %.2fs, write %.2fs)",
-                summary.get("batch"), summary.get("signed", 0), summary.get("skipped", 0), t2 - t0, t1 - t0, t2 - t1)
+    for group, extra in ((cold, None), (sessioned, SESSION_IDENTITY)):
+        if not group:
+            continue
+        identity = _signer.identity if extra is None else {**_signer.identity, **extra}
+        plans = list({p.digest(): p for _, _, p in group if p is not None}.values())
+        _signer.plans.update({p.digest(): p for p in plans})
+        t0 = time.perf_counter()
+        results = _signer.sign_captured([rec for rec, _, _ in group], [row for _, row, _ in group],
+                                        identity=identity if extra is not None else None)
+        t1 = time.perf_counter()
+        if extra is not None:
+            for res in results:
+                if res.reduced is None:
+                    _count_session_unsigned(res.record, f"not reduced: {res.skipped}")
+        summary = _sign_spool.add_signed(_sign_writer, results, identity, plans=plans or None)
+        t2 = time.perf_counter()
+        _sign_timing["reduce_s"] += t1 - t0
+        _sign_timing["write_s"] += t2 - t1
+        if summary is None:
+            _sign_unwritten.append((results, plans or None, identity))
+            logger.info("sign: in-flight batch of %d rows reduced; the spool's drain lock is held, written later",
+                        len(results))
+            continue
+        _sign_count(summary)
+        logger.info("sign: in-flight batch %s: %d signed, %d skipped in %.2fs (reduce %.2fs, write %.2fs)%s",
+                    summary.get("batch"), summary.get("signed", 0), summary.get("skipped", 0), t2 - t0, t1 - t0,
+                    t2 - t1, " (KV session rows)" if extra is not None else "")
+
+
+def _count_session_unsigned(rec: Any, reason: str) -> None:
+    """A KV session's candidate left unsigned: counted in /info (sign.stats.unsigned) and on its session."""
+    _count_unsigned(f"KV session row: {reason}")
+    sid = (rec.meta.get("cache_state") or {}).get("session")
+    if _kv_sessions is not None:
+        _kv_sessions.stats["unsigned"] += 1
+        try:
+            _kv_sessions.get(sid).unsigned += 1
+        except ValueError:  # the session closed meanwhile
+            pass
 
 
 def _sign_count(summary: dict, inflight: bool = True) -> None:
@@ -2663,7 +2745,7 @@ def _sign_info() -> dict | None:
     return {"spool": str(_sign_spool.root), "writer": _sign_writer, "weights": _sign_weights,
             "drains_when_idle": _signer is not None, "inflight": _sign_inflight_arg,
             # rows captured and not yet in a written signed batch (waiting, being reduced, or held off by a drain)
-            "pending_inflight": len(_sign_pending) + _sign_reducing + sum(len(r) for r, _ in _sign_unwritten),
+            "pending_inflight": len(_sign_pending) + _sign_reducing + sum(len(r) for r, _, _ in _sign_unwritten),
             "reducer": getattr(_signer.reducer, "reducer_identity", None) if _signer is not None else None,
             "stats": dict(_sign_stats),
             "inflight_timing": {**{k: round(v, 3) for k, v in _sign_timing.items()},
@@ -2710,7 +2792,10 @@ async def _batched_candidates(request: GenerateRequest, n: int) -> list[Generate
     """All n candidates from one batched path (cross-request batcher, else the n-row decoder), or [] when neither
     takes the request and the caller generates candidates one at a time. A seeded request that no batched path
     takes is a 400: only the seeded row decoders draw from per-candidate seeds. A request that sets ``sign`` takes the
-    batched paths only, and its candidates' records go to the sign spool."""
+    batched paths only, and its candidates' records go to the sign spool. A KV session's turn takes the batcher only
+    (_session_candidates)."""
+    if request.kv_session is not None:
+        return await _session_candidates(request, n)
     if request.sign:
         _check_sign(request)
         if _sign_inflight_arg and _xbatch_compatible(request, n):
@@ -2744,6 +2829,188 @@ async def _batched_candidates(request: GenerateRequest, n: int) -> list[Generate
     return []
 
 
+def _session_error(exc: Exception) -> HTTPException:
+    return HTTPException(getattr(exc, "status", 400), str(exc))
+
+
+def _session_new_ids(request: GenerateRequest) -> list[int]:
+    """A session turn's new tokens: ``prompt_ids`` as sent, or the prompt text encoded with no special tokens (a
+    turn continues a sequence; it does not start one). May be empty when ``append_from`` names a candidate."""
+    if request.messages is not None:
+        raise HTTPException(400, "a KV session's turn sends its new tokens as 'prompt' or 'prompt_ids', not messages")
+    if request.prompt_ids is not None:
+        if request.prompt is not None:
+            raise HTTPException(400, "Pass one of 'prompt_ids' or 'prompt'")
+        vocab = int(_model.config.vocab_size) if _model is not None else None
+        if vocab is not None and not all(0 <= t < vocab for t in request.prompt_ids):
+            raise HTTPException(400, f"prompt_ids must be ids in [0, {vocab})")
+        return list(request.prompt_ids)
+    return list(_tokenizer.encode(request.prompt or "", add_special_tokens=False))
+
+
+async def _session_candidates(request: GenerateRequest, n: int) -> list[GenerateResponse]:
+    """A KV session's turn (kotodama.serve.kv_sessions): its new tokens prefilled against the session's KV, n
+    candidates decoded by the cross-request batcher, each candidate's decode-written KV kept for the next turn. A
+    signed turn is signed in flight only."""
+    from kotodama.serve import kv_sessions
+
+    if _kv_sessions is None:
+        raise HTTPException(400, "'kv_session' needs a server started with --kv_sessions")
+    if request.stream:
+        raise HTTPException(400, "a KV session's turn cannot stream")
+    if _request_wants_steering(request) or request.steer_span != "decode":
+        raise HTTPException(400, "a KV session's turn decodes unsteered (steering is not served on sessions)")
+    if not _xbatch_compatible(request, n):
+        raise HTTPException(400, "a KV session's turn needs the cross-request batcher (--xbatch_rows) and a law it "
+                                 "samples, with n within its widest bucket and max_new_tokens within the row cap")
+    if request.sign:
+        _check_sign(request)
+        if not _sign_inflight_arg:
+            raise HTTPException(400, "a signed KV session's turn is signed in flight only (--sign_inflight): no "
+                                     "drain can replay a session's KV from its ids")
+    new_ids = _session_new_ids(request)
+    try:
+        sess = _kv_sessions.claim(request.kv_session)
+    except kv_sessions.SessionError as exc:
+        raise _session_error(exc) from exc
+    try:
+        kv: list = []
+        signed: list | None = [] if request.sign else None
+        try:
+            out = await engine_generate_xbatch(request, n, signed_out=signed, session=(sess, new_ids), kv_out=kv)
+        except kv_sessions.SessionError as exc:
+            raise _session_error(exc) from exc
+        if request.sign:
+            _sign_add_inflight(request, out, signed, cache_state=sess.cache_state())
+        sess.pending = {i: kv_sessions.Candidate(ids=list(r.completion_ids or []), k=kv[i][0], v=kv[i][1],
+                                                 sign_id=r.sign_id)
+                        for i, r in enumerate(out) if i < len(kv) and kv[i] is not None}
+        _kv_sessions.stats["turns"] += 1
+        for r in out:
+            r.timing = {**(r.timing or {}), "kv_session_tokens": float(sess.length)}
+        return out
+    finally:
+        _kv_sessions.release(sess)
+
+
+class KVSessionRequest(BaseModel):
+    session: str | None = None
+    candidate: int | None = Field(default=None, ge=0)
+    start: int | None = Field(default=None, ge=0)
+    stop: int | None = Field(default=None, ge=0)
+
+
+def _need_sessions() -> "Any":
+    from kotodama.serve import kv_sessions
+
+    if _kv_sessions is None:
+        raise HTTPException(400, "KV sessions need a server started with --kv_sessions")
+    return kv_sessions
+
+
+async def _session_op(session_id: str | None, fn: Callable[..., Any], *args: Any) -> Any:
+    """Run ``fn(session, *args)`` on the generation thread, the session claimed for its duration."""
+    kv = _need_sessions()
+    if not session_id:
+        raise HTTPException(400, "name the 'session'")
+    try:
+        sess = _kv_sessions.claim(session_id)
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    try:
+        async with _engine_lock:
+            return await _run_generation(fn, sess, *args)
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    finally:
+        _kv_sessions.release(sess)
+
+
+@app.post("/kv_session/open")
+async def kv_session_open(request: KVSessionRequest):
+    """Open a KV session (its id: ``session``, or a fresh one); it starts empty."""
+    kv = _need_sessions()
+    try:
+        sess = _kv_sessions.open(request.session)
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    return {"session": sess.id, "max_seq_len": _max_seq_len}
+
+
+@app.post("/kv_session/close")
+async def kv_session_close(request: KVSessionRequest):
+    kv = _need_sessions()
+    try:
+        _kv_sessions.close(request.session or "")
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    return {"closed": request.session}
+
+
+@app.get("/kv_session/{session_id}")
+async def kv_session_info(session_id: str):
+    """A session's state: its length, unfed tokens, the last turn's candidates, its cache state and op log, its
+    token ids and its unsigned-row count."""
+    kv = _need_sessions()
+    try:
+        sess = _kv_sessions.get(session_id)
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    return {**sess.info(), "ids": list(sess.ids), "unfed_ids": list(sess.unfed),
+            "candidates": {c: {"ids": cand.ids, "fed": cand.fed, "sign_id": cand.sign_id}
+                           for c, cand in sess.pending.items()},
+            "ops": sess.cache_state()["ops"]}
+
+
+@app.post("/kv_session/append")
+async def kv_session_append(request: KVSessionRequest):
+    """Join ``candidate`` of the last turn to the session (as a turn's ``append_from`` does), so session ops can
+    run on it before the next turn."""
+    kv = _need_sessions()
+    if request.candidate is None:
+        raise HTTPException(400, "name the 'candidate'")
+    await _session_op(request.session, kv.append, request.candidate)
+    return _kv_sessions.get(request.session).info()
+
+
+@app.post("/kv_session/evict")
+async def kv_session_evict(request: KVSessionRequest):
+    """Drop positions [start, stop) and renumber the survivors, each moved key re-rotated through the model's RoPE
+    table (kotodama.model.session_kv.evict_rerotate)."""
+    kv = _need_sessions()
+    if request.start is None or request.stop is None:
+        raise HTTPException(400, "name 'start' and 'stop'")
+    await _session_op(request.session, functools.partial(kv.evict, _engine), request.start, request.stop)
+    return _kv_sessions.get(request.session).info()
+
+
+@app.post("/kv_session/export")
+async def kv_session_export(request: KVSessionRequest):
+    """Positions [start, stop) as safetensors (k, v; their ids and rotation in the metadata)."""
+    kv = _need_sessions()
+    if request.start is None or request.stop is None:
+        raise HTTPException(400, "name 'start' and 'stop'")
+    blob = await _session_op(request.session, kv.export, request.start, request.stop)
+    return Response(content=blob, media_type="application/octet-stream")
+
+
+@app.post("/kv_session/import")
+async def kv_session_import(http_request: Request, session: str, at: int, rows_from: int | None = None):
+    """Insert an export's rows before position ``at`` (the body: the export's bytes; ``rows_from`` overrides where
+    its keys are rotated to). The rows move as a block, re-rotated to their new positions."""
+    kv = _need_sessions()
+    try:
+        k, v, ids, frm, meta = kv.parse_rows(await http_request.body())
+    except kv.SessionError as exc:
+        raise _session_error(exc) from exc
+    vocab = int(_model.config.vocab_size) if _model is not None else None
+    if vocab is not None and not all(0 <= t < vocab for t in ids):
+        raise HTTPException(400, f"the export's ids must be in [0, {vocab})")
+    await _session_op(session, functools.partial(kv.import_, _engine), k, v, ids, at,
+                      frm if rows_from is None else rows_from, meta.get("session"))
+    return _kv_sessions.get(session).info()
+
+
 def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest:
     """The /generate request one /v1/completions choice runs: sampling, stops and steering carried over."""
     stop_strings: list[str] = []
@@ -2771,6 +3038,8 @@ def oai_completion_to_generate(request: OAICompletionRequest) -> GenerateRequest
         min_p=request.min_p,
         sign=request.sign,
         sign_meta=request.sign_meta,
+        kv_session=request.kv_session,
+        append_from=request.append_from,
     )
 
 
@@ -3167,6 +3436,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "exact token ids and sign id, in daily files compressed once their day is over. Off "
                              "unless given; a request's \"log\": false keeps it out. A gateway fleet turns it on for "
                              "every replica with serve_args: [\"--request_log\", \"DIR\"]")
+    parser.add_argument("--kv_sessions", type=int, default=0, metavar="N",
+                        help="Hold up to N KV sessions (kotodama.serve.kv_sessions): conversations whose KV lives "
+                             "across their requests (a turn sends only its new tokens with 'kv_session'; "
+                             "/kv_session/{open,close,append,evict,export,import} work on a session between turns). "
+                             "Needs --xbatch_rows. 0 (default): off")
+    parser.add_argument("--kv_session_idle_s", type=float, default=3600.0,
+                        help="A KV session idle this long is closed when a new session needs its room")
     parser.add_argument("--sign_default", action=argparse.BooleanOptionalAction, default=False,
                         help="Sign every generation request that does not set `sign` (an explicit `sign: false` "
                              "opts out and is counted); /logprobs and /score_tokens are never signed. A server that "
@@ -3331,6 +3607,10 @@ if __name__ == "__main__":
     _sign_default_arg = args.sign_default
     _profile_name = _profile_arg
     _request_log_arg = args.request_log
+    if args.kv_sessions and not _xbatch_rows_arg:
+        parser.error("--kv_sessions needs --xbatch_rows (a session's turn decodes on the cross-request batcher)")
+    _kv_sessions_arg = args.kv_sessions
+    _kv_session_idle_s_arg = args.kv_session_idle_s
     _sign_audit_every_arg = args.sign_audit_every
 
     import uvicorn

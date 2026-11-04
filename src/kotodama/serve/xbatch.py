@@ -71,6 +71,9 @@ class XBatchResult:
     # signed jobs: candidate i's signed span (kotodama.model.signing.SignedRow, on the decoder's device), or None when
     # it fed fewer than one position, its span does not fit the sign tail, or the job's prefill reused cached KV
     signed: list[Any] = field(default_factory=list)
+    # jobs that keep their KV (``XBatchJob.keep_kv``): candidate i's decode-written KV as kotodama.serve.kv_sessions
+    # .row_kv gives it, for its fed tokens ((k, v), each [layers, n_kv_heads, fed, head_dim])
+    kv: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -95,6 +98,14 @@ class XBatchJob:
     # seeded decoders: candidate i draws with candidate_seed(seed, i), in any batch (always on the widest bucket)
     seed: Optional[int] = None
     sign: bool = False  # decode on the signing decoder and export each candidate's signed span
+    # a prefill of its own instead of the runner's (a KV session's turn: kotodama.serve.kv_sessions.prefill), called
+    # on the generation thread when the job is admitted; returns what the runner's prefill returns
+    prefill: Optional[Callable[[], tuple]] = None
+    # called right after the job's rows are admitted (its prompt KV copied into them): a session turn marks the
+    # engine's KV unreusable here, once the decoder has checked how it was written
+    admitted: Optional[Callable[[], None]] = None
+    # copy each candidate's decode-written KV out of its row when it ends (into XBatchResult.kv)
+    keep_kv: bool = False
     t_enqueue: float = field(default_factory=time.perf_counter)
 
 
@@ -169,6 +180,7 @@ class _Live:
     stops: dict[int, int] = field(default_factory=dict)  # candidate -> the stop token that ended it
     signed: dict[int, Any] = field(default_factory=dict)  # candidate -> its exported span (signed jobs)
     kv_reused: int = 0  # prompt tokens whose KV the prefill took from a prefix cache or pool (signed: not exported)
+    kept_kv: dict[int, Any] = field(default_factory=dict)  # candidate -> its decode-written KV (keep_kv jobs)
 
     @property
     def done(self) -> bool:
@@ -244,7 +256,9 @@ class XBatchRunner:
             # a seeded job's prompt is prefilled cold: its draws must not depend on what a prefix cache held; nor may
             # a signed job's signature (cached KV came from another prefill's split, with other bytes)
             fresh = {"fresh": True} if job.seed is not None or job.sign else {}
-            if self.levers is not None:
+            if job.prefill is not None:  # its own prefill (a session turn: unsteered, never a cache hit)
+                logits, info = job.prefill()
+            elif self.levers is not None:
                 slot = self.levers.bind(job.lever) if job.lever is not None else 0
                 logits, info = self.prefill(ids, slot, **fresh)
             else:
@@ -257,6 +271,8 @@ class XBatchRunner:
             if job.seed is not None:
                 kw["seeds"] = [candidate_seed(job.seed, c) for c in range(m)]
             first = dec.admit(rows, logits, job.params, **kw)
+            if job.admitted is not None:
+                job.admitted()
             del free[:m]
         except Exception as exc:
             logger.warning("xbatch: prefill/admit failed for a %d-token prompt: %r", len(job.prompt_ids), exc)
@@ -327,6 +343,14 @@ class XBatchRunner:
         slot)."""
         cand = lv.running.pop(row)
         dec = self._dec
+        if lv.job.keep_kv and dec is not None:
+            from kotodama.serve.kv_sessions import row_kv
+
+            # the KV its decode steps wrote: every generated id but the last was fed, and the last too when a stop
+            # token followed it (the step in flight writes one slot further, past what is copied)
+            out = lv.out[cand]
+            fed = len(out) if cand in lv.stops else max(len(out) - 1, 0)
+            lv.kept_kv[cand] = row_kv(dec, row, lv.prompt_len, fed)
         if not lv.job.sign or dec is None or getattr(dec, "sign", None) is None:
             return
         from kotodama.model.signer import trim
@@ -358,8 +382,9 @@ class XBatchRunner:
         lv.timing["decode_ms"] = round((time.perf_counter() - lv.t_admit) * 1000 - lv.timing["prefill_ms"], 2)
         lv.timing["total_ms"] = round((time.perf_counter() - lv.job.t_enqueue) * 1000, 2)
         signed = [lv.signed.get(c) for c in range(lv.job.n)] if lv.job.sign else []
+        kv = [lv.kept_kv.get(c) for c in range(lv.job.n)] if lv.job.keep_kv else []
         self._deliver(lv.job, XBatchResult(rows=lv.out, timing=lv.timing,
-                                           stops=[lv.stops.get(c) for c in range(lv.job.n)], signed=signed))
+                                           stops=[lv.stops.get(c) for c in range(lv.job.n)], signed=signed, kv=kv))
 
     def _fill(self, dec: MultiSampleDecoder, active: list[_Live], free: list[int], head: XBatchJob) -> int:
         """Hand free rows out: a job's unstarted candidates restart in the job's own free rows (the only rows that

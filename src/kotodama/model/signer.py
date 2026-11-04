@@ -461,13 +461,15 @@ class RecordSigner:
         return order, signed
 
     @torch.inference_mode()
-    def sign_captured(self, records: Sequence[SignRecord],
-                      rows: Sequence[Optional[signing.SignedRow]]) -> list[SignResult]:
+    def sign_captured(self, records: Sequence[SignRecord], rows: Sequence[Optional[signing.SignedRow]],
+                      identity: Optional[dict[str, Any]] = None) -> list[SignResult]:
         """Reduce rows the signing decoder captured as it generated them (in-flight signing: ``rows[i]`` is
         ``records[i]``'s span, exported when its generation ended; None: not exported). One result per record, in
         order; a record is skipped for the reasons ``sign`` skips it, or when its span was not exported. Rows reduce
         in batches of the decoder's width, as ``sign`` reduces them; their signatures are the ones ``sign`` gives the
-        same records on this signer (same decoder, scoring instead of sampling)."""
+        same records on this signer (same decoder, scoring instead of sampling). ``identity``: the capture identity
+        the reducer names their lane by, when it is not this signer's (rows whose KV came from somewhere a replay of
+        their ids does not reach, such as a KV session, add what made it)."""
         if len(rows) != len(records):
             raise ValueError(f"{len(rows)} captured rows for {len(records)} records")
         results = [SignResult(record=r) for r in records]
@@ -494,17 +496,19 @@ class RecordSigner:
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
             t0 = time.perf_counter()
-            self._reduce(records, results, order, signed)
+            self._reduce(records, results, order, signed, identity=identity)
             self.timing["reduce_s"] += time.perf_counter() - t0
             self.timing["rows"] += len(order)
         return results
 
     def _reduce(self, records: Sequence[SignRecord], results: list[SignResult], order: list[int],
-                signed: list[signing.SignedRow]) -> None:
+                signed: list[signing.SignedRow], identity: Optional[dict[str, Any]] = None) -> None:
         """Reduce a batch's rows together; if the reducer refuses the batch, row by row."""
+        engine = identity if identity is not None else self.identity
+
         def call(ix: list[int], rows: list[signing.SignedRow]) -> list[signing.ReducedRow]:
             with deterministic_algorithms():
-                out = self.reducer.reduce(rows, engine=self.identity,
+                out = self.reducer.reduce(rows, engine=engine,
                                           token_ids=[records[i].prompt_ids + records[i].generated_ids for i in ix])
             if len(out) != len(rows):
                 raise RuntimeError(f"the reducer returned {len(out)} rows for {len(rows)}")
