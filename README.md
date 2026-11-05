@@ -47,9 +47,10 @@ batteries scored against public base models. On those tests, kotodama-tsumugi-1b
 - **keeps *you* apart from the speaker.** Read zero-shot, its interpretation of a *you*
   whose referent has moved isn't inverted toward the speaker.
 - **tracks *you* through hand-offs from three examples.** Shown three worked examples,
-  it tracks who *you* is after objects change hands. Among public base models at 3B
-  or below, it is the only one that does. The next smallest model that does is
-  Qwen3-4B, which was trained on 36T tokens, about 300 times tsumugi's 110B.
+  it tracks who *you* is after objects change hands. Under the benchmark's binding
+  rule, it is the only public base model at 3B or below that does. The next smallest
+  model that does is Qwen3-4B, which was trained on 36T tokens, about 300 times
+  tsumugi's 110B.
 - **learns rules from its prompt beyond its size.** On fresh items of the Atlas's
   in-context batteries (invented grammar, operators and patterns), it scores above
   the size trend of 37 public base models up to 10B, while recalling facts in the
