@@ -661,7 +661,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                                   stop_ids=_stop_token_ids, max_seq_len=_max_seq_len, device=_device,
                                   refill=xbatch_refill, should_yield=_engine_lock_contended,
                                   levers=_engine.levers)
-            _xbatch = XBatchScheduler(runner, _engine_lock, _run_generation)
+            _xbatch = XBatchScheduler(runner, _engine_lock, _run_generation, gather_s=_xbatch_gather_ms_arg / 1000,
+                                      gather_quiet_s=_xbatch_gather_quiet_ms_arg / 1000)
             logger.info("Cross-request batched decode ENABLED: row buckets %s, refill %s", sorted(set(xbatch_rows)),
                         "on" if xbatch_refill else "off")
         # Disable cuDNN SDPA only AFTER the engine compiled: the captured
@@ -1619,6 +1620,9 @@ _multi_rows_arg: tuple[int, ...] = ()
 _xbatch_rows_arg: tuple[int, ...] = ()
 _prefill_buckets_arg: tuple[int, ...] = ()
 _xbatch_refill_arg = False
+# --xbatch_gather_ms / --xbatch_gather_quiet_ms: how long a batch waits for a burst before picking its bucket
+_xbatch_gather_ms_arg = 20.0
+_xbatch_gather_quiet_ms_arg = 2.0
 _prefix_pool_tokens_arg = 0
 _prefix_pool_block_arg = 16
 _cascade_attn_arg = False
@@ -2031,6 +2035,8 @@ async def info():
         default_repetition_penalty=_default_repetition_penalty,
         xbatch=None if _xbatch is None else {"rows": sorted(_xbatch.runner.decoders),
                                              "refill": _xbatch.runner.refill,
+                                             "gather_ms": [_xbatch.gather_s * 1000, _xbatch.gather_quiet_s * 1000],
+                                             "gather": dict(_xbatch.gather_stats),
                                              "stats": dict(_xbatch.runner.stats)},
         prefix_pool=None if _prefix_pool is None else {"blocks": _prefix_pool.n_blocks,
                                                        "block_size": _prefix_pool.block_size,
@@ -3403,6 +3409,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xbatch_refill", action=argparse.BooleanOptionalAction, default=False,
                         help="With --xbatch_rows: refill rows freed by finished requests from the queue between "
                              "decode steps (continuous batching) instead of waiting for the batch's longest row")
+    parser.add_argument("--xbatch_gather_ms", type=float, default=20.0,
+                        help="With --xbatch_rows: before a batch starts on a narrower bucket than the widest, wait "
+                             "up to this long for a burst of concurrent requests to arrive, so they share one batch "
+                             "instead of draining through the narrow bucket a few rows at a time (0: off)")
+    parser.add_argument("--xbatch_gather_quiet_ms", type=float, default=2.0,
+                        help="With --xbatch_gather_ms: the burst has arrived once no request has come for this long")
     parser.add_argument("--prefix_pool_tokens", type=int, default=0,
                         help="Multi-entry prefix KV cache: pool this many prompt tokens of KV (fixed-size blocks, "
                              "least recently used evicted) so a prompt sharing a prefix with ANY recently prefilled "
@@ -3595,6 +3607,8 @@ if __name__ == "__main__":
     if args.xbatch_refill and not _xbatch_rows_arg:
         parser.error("--xbatch_refill needs --xbatch_rows")
     _xbatch_refill_arg = args.xbatch_refill
+    _xbatch_gather_ms_arg = args.xbatch_gather_ms
+    _xbatch_gather_quiet_ms_arg = args.xbatch_gather_quiet_ms
     if args.prefix_pool_tokens < 0 or args.prefix_pool_block < 16:
         parser.error("--prefix_pool_tokens must be >= 0 and --prefix_pool_block >= 16")
     if args.prefix_pool_tokens and _engine_arg != "fast":

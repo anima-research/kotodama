@@ -581,3 +581,71 @@ def test_seeded_jobs_decode_on_the_widest_bucket(model: KotodamaModel) -> None:
     assert widths == [4] and "b" not in rec.out
     runner.run_batch()
     assert widths == [4, 8] and "b" in rec.out
+
+
+class _GatherStub:
+    """The parts of an XBatchRunner the scheduler's pump reads: a queue, the bucket widths, and a run_batch that
+    takes one group and records its rows."""
+
+    def __init__(self, widths=(4, 8, 16)) -> None:
+        from types import SimpleNamespace
+
+        self.queue = XBatchQueue()
+        self.max_rows = max(widths)
+        self._widths = sorted(widths)
+        self._ns = SimpleNamespace
+        self.batches: list[int] = []
+
+    def bucket_for(self, rows: int):
+        return self._ns(rows=next((w for w in self._widths if w >= rows), self.max_rows))
+
+    def run_batch(self) -> int:
+        jobs = self.queue.take_group(self.max_rows)
+        self.batches.append(sum(j.n for j in jobs))
+        for job in jobs:
+            XBatchRunner._deliver(job, "ok")
+        return len(jobs)
+
+
+def _gather_job(n: int, seed=None) -> XBatchJob:
+    return XBatchJob(key="k", prompt_ids=[1], n=n, max_new_tokens=1,
+                     params=SamplingParams(temperature=1.0, repetition_penalty=1.0), done=lambda _o: None, seed=seed)
+
+
+def _burst(gather_s: float, jobs: int, n: int, spread_s: float, seed=None) -> tuple[list[int], dict]:
+    """``jobs`` requests of ``n`` rows arriving ``spread_s`` apart; the batches' row counts and the gather stats."""
+    stub = _GatherStub()
+
+    async def go():
+        async def run_inline(fn):
+            return fn()
+
+        sched = XBatchScheduler(stub, asyncio.Lock(), run_inline, gather_s=gather_s, gather_quiet_s=0.01)
+
+        async def one(i):
+            await asyncio.sleep(i * spread_s)
+            return await sched.submit(_gather_job(n, seed))
+
+        out = await asyncio.gather(*(one(i) for i in range(jobs)))
+        assert out == ["ok"] * jobs
+        return sched.gather_stats
+
+    stats = asyncio.run(go())
+    return stub.batches, stats
+
+
+def test_a_burst_waits_to_share_one_batch_instead_of_draining_through_a_narrow_bucket() -> None:
+    # 4 requests of 2 rows, 2 ms apart: without the gather the first one starts a batch alone (a narrow bucket)
+    batches, stats = _burst(0.0, jobs=4, n=2, spread_s=0.002)
+    assert batches[0] == 2 and stats["gathers"] == 0
+    batches, stats = _burst(0.2, jobs=4, n=2, spread_s=0.002)
+    assert batches == [8] and stats["gathers"] == 1 and stats["grew"] == 1
+    # the wait ends once the waiting rows already take the widest bucket: no gather at all for a full burst
+    batches, stats = _burst(0.2, jobs=1, n=16, spread_s=0.0)
+    assert batches == [16] and stats["gathers"] == 0
+    # seeded jobs always decode on the widest bucket: nothing to gather for
+    batches, stats = _burst(0.2, jobs=1, n=2, spread_s=0.0, seed=7)
+    assert batches == [2] and stats["gathers"] == 0
+    # a lone request waits only the quiet interval, never the whole window
+    batches, stats = _burst(0.5, jobs=1, n=2, spread_s=0.0)
+    assert batches == [2] and stats["gathers"] == 1 and stats["waited_s"] < 0.1

@@ -124,6 +124,15 @@ class XBatchQueue:
         with self._lock:
             return len(self._jobs)
 
+    def head_rows(self) -> tuple[int, Optional[XBatchJob]]:
+        """The rows waiting under the oldest job's key (what the next batch would take, before its width cap), and
+        that job (None when the queue is empty)."""
+        with self._lock:
+            if not self._jobs:
+                return 0, None
+            head = self._jobs[0]
+            return sum(j.n for j in self._jobs if j.key == head.key), head
+
     def take_group(self, max_rows: int) -> list[XBatchJob]:
         """The oldest job's key group, oldest first, while the rows fit ``max_rows``; later jobs of the key that
         do not fit stay queued, as do jobs of other keys."""
@@ -532,10 +541,18 @@ class XBatchScheduler:
     user holds, so other request paths interleave between batches."""
 
     def __init__(self, runner: XBatchRunner, lock: asyncio.Lock,
-                 run_on_worker: Callable[[Callable[[], int]], Awaitable[int]]) -> None:
+                 run_on_worker: Callable[[Callable[[], int]], Awaitable[int]], gather_s: float = 0.0,
+                 gather_quiet_s: float = 0.002) -> None:
         self.runner = runner
         self.lock = lock
         self.run_on_worker = run_on_worker
+        # A batch's bucket is fixed when it starts, and later arrivals only refill that decoder's rows: a burst of
+        # concurrent requests whose first job alone picks a narrow bucket would drain through it a few rows at a
+        # time. So before a batch starts, while the waiting rows would pick a narrower bucket than the widest, the
+        # pump waits for the burst: until no job has arrived for gather_quiet_s, at most gather_s (0: off).
+        self.gather_s = float(gather_s)
+        self.gather_quiet_s = float(gather_quiet_s)
+        self.gather_stats = {"gathers": 0, "waited_s": 0.0, "grew": 0}
         self._pump_task: Optional[asyncio.Task] = None
 
     async def submit(self, job: XBatchJob) -> XBatchResult:
@@ -560,8 +577,37 @@ class XBatchScheduler:
             self._pump_task = asyncio.create_task(self._pump())
         return await fut
 
+    def _narrow(self, rows: int, head: Optional[XBatchJob]) -> bool:
+        """Whether a batch starting now would decode on a narrower bucket than the widest (seeded and signed jobs
+        always take the widest)."""
+        if head is None or head.seed is not None or head.sign:
+            return False
+        return rows < self.runner.max_rows and self.runner.bucket_for(rows).rows < self.runner.max_rows
+
+    async def _gather(self) -> None:
+        """Wait for a burst before a batch picks its bucket (see ``gather_s``)."""
+        rows, head = self.runner.queue.head_rows()
+        if self.gather_s <= 0 or not self._narrow(rows, head):
+            return
+        loop = asyncio.get_running_loop()
+        start = quiet_from = loop.time()
+        first = last = rows
+        while True:
+            await asyncio.sleep(min(self.gather_quiet_s / 4, 0.001))
+            rows, head = self.runner.queue.head_rows()
+            now = loop.time()
+            if rows != last:
+                last, quiet_from = rows, now
+            if (not self._narrow(rows, head) or now - quiet_from >= self.gather_quiet_s
+                    or now - start >= self.gather_s):
+                break
+        self.gather_stats["gathers"] += 1
+        self.gather_stats["waited_s"] += now - start
+        self.gather_stats["grew"] += int(rows > first)
+
     async def _pump(self) -> None:
         while len(self.runner.queue):
+            await self._gather()
             async with self.lock:
                 try:
                     await self.run_on_worker(self.runner.run_batch)
