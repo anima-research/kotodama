@@ -55,7 +55,8 @@ batteries scored against public base models. On those tests, kotodama-tsumugi-1b
 - **learns rules from its prompt beyond its size.** On fresh items of the Atlas's
   in-context batteries (invented grammar, operators and patterns), it scores above
   the size trend of 37 public base models up to 10B, while recalling facts in the
-  same format and plain language modelling sit on that trend.
+  same format and plain language modelling sit on that trend
+  ([the registered test](https://huggingface.co/LuxiaSL/kotodama-tsumugi-1b#learning-rules-from-the-prompt)).
 
 In short, it binds like base models of 1–2B parameters trained on 40 to 300 times
 more data.
