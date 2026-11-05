@@ -50,6 +50,10 @@ batteries scored against public base models. On those tests, kotodama-tsumugi-1b
   it tracks who *you* is after objects change hands. Among public base models at 3B
   or below, it is the only one that does. The next smallest model that does is
   Qwen3-4B, which was trained on 36T tokens, about 300 times tsumugi's 110B.
+- **learns rules from its prompt beyond its size.** On fresh items of the Atlas's
+  in-context batteries (invented grammar, operators and patterns), it scores above
+  the size trend of 37 public base models up to 10B, while recalling facts in the
+  same format and plain language modelling sit on that trend.
 
 In short, it binds like base models of 1–2B parameters trained on 40 to 300 times
 more data.
