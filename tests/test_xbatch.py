@@ -649,3 +649,34 @@ def test_a_burst_waits_to_share_one_batch_instead_of_draining_through_a_narrow_b
     # a lone request waits only the quiet interval, never the whole window
     batches, stats = _burst(0.5, jobs=1, n=2, spread_s=0.0)
     assert batches == [2] and stats["gathers"] == 1 and stats["waited_s"] < 0.1
+
+
+def test_a_batch_after_a_burst_starts_wide_enough_for_it(model: KotodamaModel) -> None:
+    """Requests of a burst keep arriving after its first batch started; the runner remembers how many rows were
+    running or waiting at once and starts the next unseeded batch on a bucket that wide, so late arrivals refill
+    into it. The memory halves after each batch that stays under it."""
+    eng = _engine(model)
+    runner, rec = _runner(eng, widths=(2, 4), refill=True), _Rec()
+    arrivals = [rec.job("late0", _ids(5, 61), 1, max_new=2), rec.job("late1", _ids(6, 62), 1, max_new=2)]
+
+    def burst() -> None:  # two more requests arrive once the first batch is running
+        while arrivals:
+            runner.queue.put(arrivals.pop())
+
+    runner.between_steps = burst
+    runner.queue.put(rec.job("first", _ids(4, 60), 1, max_new=4))
+    runner.run_batch()
+    runner.between_steps = lambda: None
+    assert runner._demand == 3 and runner.stats["widened"] == 0  # one running + two waiting at once
+    while len(runner.queue):
+        runner.run_batch()
+    runner.queue.put(rec.job("next", _ids(7, 63), 1, max_new=2))
+    seen = []
+    decode_rows = runner.bucket_for
+    runner.bucket_for = lambda rows: (seen.append(rows), decode_rows(rows))[1]
+    runner.run_batch()
+    assert seen[0] == 3 and runner.stats["widened"] >= 1  # a 1-row request starts on the 4-row bucket
+    for i in range(3):  # light traffic: the memory decays back to the request's own width
+        runner.queue.put(rec.job(f"light{i}", _ids(5, 70 + i), 1, max_new=2))
+        runner.run_batch()
+    assert runner._demand == 1

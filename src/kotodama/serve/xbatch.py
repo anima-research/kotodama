@@ -124,6 +124,11 @@ class XBatchQueue:
         with self._lock:
             return len(self._jobs)
 
+    def rows_for(self, key: Hashable) -> int:
+        """The rows waiting under ``key``."""
+        with self._lock:
+            return sum(j.n for j in self._jobs if j.key == key)
+
     def head_rows(self) -> tuple[int, Optional[XBatchJob]]:
         """The rows waiting under the oldest job's key (what the next batch would take, before its width cap), and
         that job (None when the queue is empty)."""
@@ -237,11 +242,15 @@ class XBatchRunner:
         # polled on the generation thread between steps and after each batch (the server reduces signed rows there)
         self.between_steps = between_steps or (lambda: None)
         self._dec: Optional[MultiSampleDecoder] = None  # the decoder of the running batch
+        # The most rows of one batch's key that were running or waiting at once during the last batch (halved after
+        # each batch that stays under it). An unseeded batch starts on a bucket at least this wide: requests of a
+        # burst keep arriving after its first batch has started, and only a bucket with room takes them by refill.
+        self._demand = 0
         self.queue = XBatchQueue()
         self.stats: dict[str, float] = {"batches": 0, "steps": 0, "row_steps": 0, "useful_row_steps": 0,
                                         "admitted": 0, "refilled": 0, "restarts": 0, "prefill_s": 0.0,
                                         "step_s": 0.0, "host_s": 0.0, "signed_rows": 0, "export_s": 0.0,
-                                        "reused_kv_rows": 0}
+                                        "reused_kv_rows": 0, "widened": 0}
 
     def bucket_for(self, rows: int) -> MultiSampleDecoder:
         """The narrowest decoder that holds ``rows`` rows (the widest when none does)."""
@@ -462,7 +471,10 @@ class XBatchRunner:
                 return len(jobs)
             dec = self.sign_decoder
         else:
-            dec = self.decoders[self.max_rows] if seeded else self.bucket_for(sum(j.n for j in jobs))
+            want = sum(j.n for j in jobs)
+            dec = self.decoders[self.max_rows] if seeded else self.bucket_for(max(want, self._demand))
+            if not seeded and dec.rows > self.bucket_for(want).rows:
+                self.stats["widened"] += 1
         self._dec = dec
         free = list(range(dec.rows))
         dec.release(free)  # whatever the decoder's rows held belongs to an earlier batch
@@ -491,8 +503,11 @@ class XBatchRunner:
             bufs = [torch.empty(dec.rows, dtype=torch.long, pin_memory=cuda) for _ in range(2)]
             pending: Optional[tuple[torch.Tensor, Any, list[tuple[int, _Live, int]]]] = None
             k = 0
+            peak = 0
             while True:
                 served += self._fill(dec, active, free, head)
+                peak = max(peak, sum(lv.job.n - lv.started + len(lv.running) for lv in active)
+                           + self.queue.rows_for(head.key))
                 if not active and pending is None:
                     break
                 self.between_steps()
@@ -521,6 +536,7 @@ class XBatchRunner:
                     self.stats["step_s"] += t1 - t0
                     self.stats["host_s"] += time.perf_counter() - t1
                 pending = launched
+            self._demand = peak if peak >= self._demand else max(peak, self._demand // 2)
         except Exception as exc:
             logger.exception("xbatch: batch failed with %d live requests", len(active))
             for lv in active:
