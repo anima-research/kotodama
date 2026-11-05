@@ -39,8 +39,7 @@ The [Binding Atlas](https://kotodama.animalabs.ai/binding-atlas.html) tests whet
 batteries scored against public base models. On those tests, kotodama-tsumugi-1b:
 
 - **binds a static *you* early.** It binds *you* to the person being addressed by 33B
-  training tokens. OLMo-2 13B needed about the same number of tokens for this stage;
-  OLMo-2 1B needed about 420B ([stage cost by model size](https://kotodama.animalabs.ai/binding-atlas.html#f3h)).
+  training tokens ([stage cost by model size](https://kotodama.animalabs.ai/binding-atlas.html#f3h)).
 - **follows hand-offs told in the third person.** When objects change hands in a
   story, it tracks who holds them better than every Pythia model up to 6.9B and than
   Llama-3.2-1B ([stage 5, taken apart](https://kotodama.animalabs.ai/binding-atlas.html#t1h)).
