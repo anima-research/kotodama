@@ -211,6 +211,24 @@ def evaluate_batched(score_chunks: ChunkScorer, encode: EncodeFn,
 
 # ── vLLM engine ───────────────────────────────────────────────────────────────
 
+LONG_MAX_MODEL_LEN_ENV = "VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+
+
+def engine_max_model_len(chunk_size: int, context: int) -> tuple[int, bool]:
+    """(``max_model_len``, whether it exceeds the model's context).
+
+    vLLM admits a generation prompt only when it is shorter than
+    ``max_model_len``, because the request must emit one token; a full chunk is
+    ``chunk_size + 1`` tokens, so the engine needs ``chunk_size + 2``. When the
+    chunk was capped at ``context - 1`` that is one past the model's context:
+    vLLM accepts it only with ``VLLM_ALLOW_LONG_MAX_MODEL_LEN=1``, and the extra
+    position is never run (``max_tokens=1`` samples from the last prefill logits
+    and stops), so no prompt position is scored beyond the context.
+    """
+    n = chunk_size + 2
+    return n, n > context
+
+
 def model_context(model_id: str, revision: str, cache_dir: str | None,
                   trust_remote_code: bool) -> int:
     """Max positions, read as the HF runner reads them (``max_position_embeddings``,
@@ -299,7 +317,10 @@ def make_vllm_scorer(llm: Any) -> ChunkScorer:
 
     def score(chunks: Sequence[list[int]]) -> list[float]:
         prompts = [{"prompt_token_ids": list(c)} for c in chunks]
-        outs = llm.generate(prompts, params, use_tqdm=False)
+        try:
+            outs = llm.generate(prompts, params, use_tqdm=False)
+        except Exception as exc:
+            raise ScoringError(f"generate failed: {type(exc).__name__}: {exc}") from exc
         if len(outs) != len(chunks):
             raise ScoringError(f"{len(outs)} outputs for {len(chunks)} prompts")
         sums: list[float] = []
@@ -338,7 +359,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "(tokens x vocab) beyond what vLLM reserves")
     p.add_argument("--max-num-batched-tokens", type=int, default=8192,
                    help="tokens per engine step (bounds the fp32 logits); raised to "
-                        "chunk + 1 when smaller; 0 = vLLM's default")
+                        "max_model_len when smaller; 0 = vLLM's default")
     p.add_argument("--max-num-seqs", type=int, default=0, help="0 = vLLM's default")
     p.add_argument("--batch-chunks", type=int, default=512,
                    help="chunks submitted per generate call")
@@ -378,7 +399,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return tok(text, add_special_tokens=False)["input_ids"]
 
     t_load = time.time()
-    llm = build_llm(args, max_model_len=chunk + 1)
+    max_model_len, beyond_context = engine_max_model_len(chunk, context)
+    if beyond_context:
+        os.environ[LONG_MAX_MODEL_LEN_ENV] = "1"
+        logger.info("max_model_len %d is one past context %d (the sampled token's slot); "
+                    "set %s=1", max_model_len, context, LONG_MAX_MODEL_LEN_ENV)
+    llm = build_llm(args, max_model_len=max_model_len)
     load_seconds = round(time.time() - t_load, 1)
     logger.info("engine up in %.1fs", load_seconds)
     import vllm
@@ -404,7 +430,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "commit": commit,
             "tokenizer_revision": tok_rev,
             "context": context,
-            "max_model_len": chunk + 1,
+            "max_model_len": max_model_len,
             "trust_remote_code": args.trust_remote_code,
             "model_impl": args.model_impl,
             "engine_architecture": engine_architecture(llm),

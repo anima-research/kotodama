@@ -15,6 +15,7 @@ from scripts.eval.run_uncheatable_vllm import (
     ScoringError,
     chunk_nll_from_prompt_logprobs,
     doc_chunks,
+    engine_max_model_len,
     eval_domain_batched,
     evaluate_batched,
 )
@@ -187,3 +188,10 @@ def test_scorer_returning_wrong_count_is_an_error():
         eval_domain_batched(lambda chunks: [1.0], encode, ["abcdefgh"], 0, chunk_size=3,
                             batch_chunks=4)
 
+
+def test_engine_length_leaves_room_for_the_sampled_token():
+    # a full chunk is chunk + 1 tokens and vLLM wants prompt < max_model_len
+    assert engine_max_model_len(4000, 8192) == (4002, False)
+    assert engine_max_model_len(4000, 4002) == (4002, False)
+    assert engine_max_model_len(4000, 4001) == (4002, True)   # chunk capped at context - 1
+    assert engine_max_model_len(2047, 2048) == (2049, True)
