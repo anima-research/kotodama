@@ -89,24 +89,28 @@ def make_hf_eval_lm(
     return HFEvalLM()
 
 
-def load_tokenizer(repo: str, revision: str, cache_dir: str | None):
+def load_tokenizer(repo: str, revision: str, cache_dir: str | None, trust_remote_code: bool = False):
     """The revision's tokenizer, or main's when the revision ships none.
 
     Some intermediate revisions carry weights and config but no tokenizer
     files, and transformers then builds an empty tokenizer (encode -> []).
     A training run's tokenizer is fixed, so main's is the right one.
+    ``trust_remote_code`` reaches both loads: a repository whose tokenizer is
+    custom code (Kimi-K2's tiktoken tokenizer) refuses to load without it.
     """
     from transformers import AutoTokenizer
 
     probe = "The quick brown fox"
     try:
-        tok = AutoTokenizer.from_pretrained(repo, revision=revision, cache_dir=cache_dir)
+        tok = AutoTokenizer.from_pretrained(repo, revision=revision, cache_dir=cache_dir,
+                                            trust_remote_code=trust_remote_code)
         if tok.encode(probe, add_special_tokens=False):
             return tok, revision
         logger.warning("%s@%s: tokenizer encodes to [] — using main's", repo, revision)
     except (OSError, ValueError) as exc:
         logger.warning("%s@%s: no usable tokenizer (%s) — using main's", repo, revision, exc)
-    tok = AutoTokenizer.from_pretrained(repo, revision="main", cache_dir=cache_dir)
+    tok = AutoTokenizer.from_pretrained(repo, revision="main", cache_dir=cache_dir,
+                                        trust_remote_code=trust_remote_code)
     if not tok.encode(probe, add_special_tokens=False):
         raise RuntimeError(f"{repo}: main's tokenizer also encodes to []")
     return tok, "main"

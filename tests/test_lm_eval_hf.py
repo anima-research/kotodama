@@ -10,7 +10,7 @@ import torch.nn.functional as F
 pytest.importorskip("lm_eval")
 transformers = pytest.importorskip("transformers")
 
-from scripts.eval.run_lm_eval_hf import make_hf_eval_lm, weight_fingerprint  # noqa: E402
+from scripts.eval.run_lm_eval_hf import load_tokenizer, make_hf_eval_lm, weight_fingerprint  # noqa: E402
 
 VOCAB = 64
 
@@ -77,3 +77,23 @@ def test_fingerprint_tracks_weights():
 def test_generation_refused():
     with pytest.raises(NotImplementedError):
         _lm(_tiny_model()).generate_until([])
+
+
+@pytest.mark.parametrize("trust", [False, True])
+def test_load_tokenizer_forwards_trust_remote_code(monkeypatch, trust):
+    """A custom-code tokenizer loads only with trust_remote_code, on the revision's load and on main's fallback."""
+    calls: list[dict] = []
+
+    class Empty(ByteTok):
+        def encode(self, s: str, add_special_tokens: bool = False) -> list[int]:
+            return [] if calls[-1]["revision"] != "main" else super().encode(s)
+
+    def fake(repo, **kw):
+        calls.append(kw)
+        return Empty()
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(fake))
+    tok, rev = load_tokenizer("org/model", "step-100", None, trust_remote_code=trust)
+    assert rev == "main" and tok.encode("ab")
+    assert [c["revision"] for c in calls] == ["step-100", "main"]
+    assert all(c["trust_remote_code"] is trust for c in calls)

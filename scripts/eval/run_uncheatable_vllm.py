@@ -387,7 +387,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("data: %d domains, %d docs from %s", len(domains),
                 sum(len(v) for v in domains.values()), args.data_dir)
 
-    tok, tok_rev = load_tokenizer(args.model, args.revision, args.cache_dir)
+    tok, tok_rev = load_tokenizer(args.model, args.revision, args.cache_dir, args.trust_remote_code)
     bos_mode, bos_id = document_start_token(tok)
     context = model_context(args.model, args.revision, args.cache_dir, args.trust_remote_code)
     chunk = chunk_size_for(context, args.chunk_size)
