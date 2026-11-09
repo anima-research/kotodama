@@ -189,6 +189,7 @@ by default, and not available with `--tp_size > 1`.
 | suite | what | needs |
 |---|---|---|
 | `riders` | riders-lite: `--inloop_riders_n` balanced items (default 200) × 4 registers × {0shot, 3shot, 3shot_relet}, scored by the same function as `/logprobs`; accuracy, chance-corrected accuracy, margin, error types | nothing (or `--inloop_riders_items` + `--inloop_riders_shots`) |
+| `setbind` | set binding: every static item (no transfers) of a bindprobes items file, 3-shot, scored by the same function as `/logprobs` and read by the benchmark's `set_metrics`; `setbind/k1` is hit@1 on the one-object sets, plus `k2`, `k3`, `k23`, `k23_exactk`, margins and counts | `--inloop_setbind_items` |
 | `induction` | random-token repeat loss drop | nothing |
 | `uncheatable` | bits/byte on the first `--inloop_uncheatable_docs` documents per domain | `--inloop_uncheatable_path` |
 | `nca_gates` | NCA ledger accuracy, for NCA-phase runs | `--inloop_nca_gates_dir` |
@@ -200,6 +201,20 @@ checkpoint `step_N` hold the same weights. Each point posts one metrics batch
 (`inloop/...` keys) and writes every row to
 `<checkpoint_dir>/inloop/step_<N>.jsonl`; resumes skip points already written.
 Size knobs: `--inloop_max_batch_tokens`, `--no_inloop_riders_relet`.
+
+The `setbind` items are the benchmark's `bp-v3.1` battery (64 one-object sets
+and 256 sets of two or three objects among its static items). The file is
+pinned by sha256 in the benchmark's battery registry; when the file matches a
+pin, the suite also checks that its prompts render to the battery's render pin,
+and refuses to start otherwise. `bp-v3.1` comes from an earlier version of the
+setbind generator, so it is rebuilt from its recipe (seed 2031) in a
+[binding-bench](https://github.com/anima-research/binding-bench) checkout,
+which writes `DIR/bp-v3.1/items.jsonl` and checks it against the pin:
+
+```bash
+python -m tools.replay_recipe --kotodama /path/to/kotodama-clone --battery bp-v3.1 --out DIR
+train.py ... --inloop_evals riders,setbind --inloop_setbind_items DIR/bp-v3.1/items.jsonl
+```
 
 ### Binding batteries
 

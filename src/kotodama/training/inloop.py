@@ -1,6 +1,6 @@
 """In-loop evaluations: small eval suites scored on the LIVE training weights.
 
-Enabled by ``train.py --inloop_evals riders,induction[,uncheatable,nca_gates]``
+Enabled by ``train.py --inloop_evals riders,induction[,setbind,uncheatable,nca_gates]``
 (default off). At every eval point every rank scores its shard of each suite
 in-process (no server, no checkpoint reload) on the raw module — unwrapped from
 DDP and torch.compile, so no recompiles — under ``no_grad`` + ``eval()`` (bf16
@@ -17,6 +17,10 @@ Suites:
   riders       riders-lite (the binding benchmark's ``binding_bench.riders.lite``, from the
                ``bench`` extra): N items x 4 registers x {0shot, 3shot, 3shot_relet}, scored
                by the SAME function the server's ``/logprobs`` uses (``kotodama.serve.logprobs``)
+  setbind      set binding (the binding benchmark's ``binding_bench.bindprobes.setbind``): every static
+               item (no transfers) of a bindprobes items file, 3-shot, scored by the same function
+               as ``/logprobs`` and read by the benchmark's ``set_metrics``. ``inloop/setbind/k1``
+               is hit@1 on the one-object sets, the benchmark's static set-binding k1 read
   induction    random-token repeat loss drop (``kotodama.eval.induction``)
   uncheatable  bits/byte on the first docs of each domain (``kotodama.eval.uncheatable``)
   nca_gates    NCA ledger accuracy (``kotodama.eval.nca_gates``), for NCA-phase runs
@@ -55,12 +59,15 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-SUITES: tuple[str, ...] = ("riders", "induction", "uncheatable", "nca_gates")
+SUITES: tuple[str, ...] = ("riders", "setbind", "induction", "uncheatable", "nca_gates")
 _SUITE_ALIASES = {"riders_lite": "riders", "uncheatable_mini": "uncheatable",
                   "nca": "nca_gates"}
 DEFAULT_SUITES: tuple[str, ...] = ("riders",)
 _DEFAULT_ALIASES = {"on", "default", "true", "1"}
 DEFAULT_SCHEDULE = "0:0.025,decay:0.005"
+# The set-binding read scores the static setbind items (no transfers) under the benchmark's 3-shot condition.
+SETBIND_CONDITION = "3shot"
+SETBIND_TOP_N = 5   # full-vocab top tokens kept per row, as the benchmark's grid runner keeps by default
 INLOOP_SUBDIR = "inloop"
 _FILE_RE = re.compile(r"^step_(\d+)\.jsonl$")
 
@@ -201,6 +208,7 @@ class InloopConfig:
     riders_seed: int = 0
     riders_relet: bool = True
     riders_top_n: int = 5
+    setbind_items: Optional[str] = None  # a bindprobes items.jsonl holding setbind items
     induction_n_seqs: int = 32
     induction_len: int = 128
     induction_seed: int = 0
@@ -219,6 +227,7 @@ class InloopConfig:
             riders_items=g("riders_items", None), riders_shots=g("riders_shots", None),
             riders_n=g("riders_n", 200), riders_seed=g("riders_seed", 0),
             riders_relet=g("riders_relet", True), riders_top_n=g("riders_top_n", 5),
+            setbind_items=g("setbind_items", None),
             induction_n_seqs=g("induction_n_seqs", 32), induction_len=g("induction_len", 128),
             uncheatable_path=g("uncheatable_path", None),
             uncheatable_docs=g("uncheatable_docs", 8),
@@ -243,15 +252,37 @@ def _load_tokenizer() -> Any:
 # ── The evaluator ─────────────────────────────────────────────────────────────
 
 
-def _bench_riders(*modules: str) -> tuple[Any, ...]:
-    """The binding benchmark's riders modules (``binding_bench.riders.<name>``), or a refusal naming the extra."""
+def _bench(package: str, *modules: str) -> tuple[Any, ...]:
+    """The binding benchmark's modules ``binding_bench.<package>.<name>``, or a refusal naming the extra."""
     from importlib import import_module
 
     try:
-        return tuple(import_module(f"binding_bench.riders.{m}") for m in modules)
+        return tuple(import_module(f"binding_bench.{package}.{m}") for m in modules)
     except ImportError as exc:
-        raise RuntimeError("the in-loop riders suite needs the binding benchmark: install kotodama[bench], "
-                           "or put the binding-bench checkout on PYTHONPATH") from exc
+        raise RuntimeError("the in-loop riders and setbind suites need the binding benchmark: install "
+                           "kotodama[bench], or put the binding-bench checkout on PYTHONPATH") from exc
+
+
+def _bench_riders(*modules: str) -> tuple[Any, ...]:
+    """The binding benchmark's riders modules (``binding_bench.riders.<name>``)."""
+    return _bench("riders", *modules)
+
+
+def _pinned_battery(path: Path) -> Optional[str]:
+    """The benchmark's name for the bindprobes battery whose file pin ``path`` matches, after checking that its
+    prompts render to that battery's render pin under the installed benchmark; None for an unpinned file.
+
+    A bindprobes file stores item specs and its prompts are rendered at scoring time, so the file pin alone does
+    not fix the strings; the render check refuses (``PinError``) a pinned file whose prompts the installed
+    benchmark would render differently."""
+    (bt,) = _bench("binding", "batteries")
+    digest = bt.sha256(path)
+    for b in bt.BATTERIES.values():
+        if b.kind == "bindprobes" and b.sha256 == digest:
+            bt.check_render(b, path)
+            return str(b.name)
+    return None
+
 
 class InloopEvaluator:
     """Build once at train start (every rank, same args), call :meth:`plan`, then
@@ -273,15 +304,17 @@ class InloopEvaluator:
         self.steps: list[int] = []
         self.pending: set[int] = set()
         self.notes: dict[str, Any] = {}
-        need_tok = bool({"riders", "uncheatable", "induction"} & set(cfg.suites))
+        need_tok = bool({"riders", "setbind", "uncheatable", "induction"} & set(cfg.suites))
         self.tok = tokenizer if tokenizer is not None else (_load_tokenizer() if need_tok else None)
-        text_suites = sorted({"riders", "uncheatable"} & set(cfg.suites))
+        text_suites = sorted({"riders", "setbind", "uncheatable"} & set(cfg.suites))
         if text_suites and len(self.tok) > vocab_size:
             raise ValueError(f"in-loop {','.join(text_suites)} need the language vocab: "
                              f"tokenizer has {len(self.tok)} ids, model vocab is {vocab_size} "
                              f"(an NCA-phase run? use induction / nca_gates)")
         if "riders" in cfg.suites:
             self._prep_riders()
+        if "setbind" in cfg.suites:
+            self._prep_setbind()
         if "induction" in cfg.suites:
             self._prep_induction()
         if "uncheatable" in cfg.suites:
@@ -324,6 +357,36 @@ class InloopEvaluator:
                                 "n_dropped_too_long": len(jobs) - len(keep),
                                 "prompt_tokens": int(sum(self.r_lengths)),
                                 "conditions": list(conds)}
+
+    def _prep_setbind(self) -> None:
+        bp_items, bp_grid = _bench("bindprobes", "items", "grid")
+        if not self.cfg.setbind_items:
+            raise ValueError("--inloop_evals setbind needs --inloop_setbind_items (a bindprobes items.jsonl)")
+        path = Path(self.cfg.setbind_items)
+        battery = _pinned_battery(path)
+        if battery is None:
+            logger.warning("inloop setbind: %s matches no pinned bindprobes battery; its values compare only "
+                           "with grids scored on this same file", path)
+        sel = [it for it in bp_items.load_items(path)
+               if it.family == "setbind" and int(it.meta.get("n_transfers", -1)) == 0]
+        if not sel:
+            raise ValueError(f"inloop setbind: no static setbind items (family setbind, no transfers) in {path}")
+        jobs = [bp_grid.build_payload_item(it, SETBIND_CONDITION) for it in sel]
+        lengths = [len(self.tok.encode(j["prompt"])) for j in jobs]
+        keep = [k for k, n in enumerate(lengths) if n < self.max_seq_len]
+        if len(keep) < len(jobs):
+            logger.warning("inloop setbind: %d/%d prompts exceed max_seq_len %d — dropped",
+                           len(jobs) - len(keep), len(jobs), self.max_seq_len)
+        self.s_items = [sel[k] for k in keep]
+        self.s_jobs = [jobs[k] for k in keep]
+        self.s_lengths = [lengths[k] for k in keep]
+        ks: dict[str, int] = {}
+        for it in self.s_items:
+            ks[f"k{it.meta['k']}"] = ks.get(f"k{it.meta['k']}", 0) + 1
+        self.notes["setbind"] = {"source": str(path), "battery": battery, "condition": SETBIND_CONDITION,
+                                 "n_prompts": len(self.s_jobs), "n_by_k": dict(sorted(ks.items())),
+                                 "n_dropped_too_long": len(jobs) - len(keep),
+                                 "prompt_tokens": int(sum(self.s_lengths))}
 
     def _prep_induction(self) -> None:
         from kotodama.eval.induction import build_repeat_batch, candidate_ids
@@ -459,6 +522,15 @@ class InloopEvaluator:
                 max_total_tokens=self.cfg.max_batch_tokens,
                 lengths=[self.r_lengths[i] for _, i in mine])
             return [(i, x) for (i, _), x in zip(mine, res)]
+        if suite == "setbind":
+            from kotodama.serve.logprobs import score_logprob_items
+            mine = shard(range(len(self.s_jobs)), r, w)
+            res = score_logprob_items(
+                lambda b: model_fn(b)["logits"], self.tok, [self.s_jobs[i] for _, i in mine],
+                SETBIND_TOP_N, self.device, max_seq_len=self.max_seq_len,
+                max_batch=self.cfg.max_batch, max_total_tokens=self.cfg.max_batch_tokens,
+                lengths=[self.s_lengths[i] for _, i in mine])
+            return [(i, x) for (i, _), x in zip(mine, res)]
         if suite == "induction":
             from kotodama.eval.induction import token_losses
             mine = shard(range(self.i_ids.shape[0]), r, w)
@@ -581,6 +653,20 @@ class InloopEvaluator:
                              f"(first {bad[0]['item_id']}) — name verification violated")
         return lite.summarize(rows), rows
 
+    def _reduce_setbind(self, data: list[Any]) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        bp_grid, bp_setbind = _bench("bindprobes", "grid", "setbind")
+        results = merge_shards(data, len(self.s_jobs))
+        rows = []
+        for item, res in zip(self.s_items, results):
+            row = bp_grid.score_row(item, res, SETBIND_CONDITION, "inloop")
+            if row["multi_token_candidates"]:
+                raise ValueError(f"{item.item_id} scored multi-token candidates "
+                                 f"{row['multi_token_candidates']} — name verification violated")
+            sm = bp_setbind.set_metrics(row["cand_lps"], row["gold_set"])
+            row.update(hit1=sm["hit1"], exactk=sm["exactk"], set_margin=sm["margin"])
+            rows.append(row)
+        return setbind_summary(rows), rows
+
     def _reduce_induction(self, data: list[Any]) -> tuple[dict[str, float], list[dict[str, Any]]]:
         from kotodama.eval.induction import aggregate_induction
         n = int(self.i_ids.shape[0])
@@ -641,6 +727,38 @@ class InloopEvaluator:
             os.replace(tmp, path)
         except OSError as e:  # a full disk must not kill training
             logger.error("inloop: could not write step %d rows: %s", step, e)
+
+
+def setbind_summary(rows: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Set-binding metrics from scored rows (``k``, ``hit1``, ``exactk``, ``set_margin``), keys under ``setbind/``:
+
+    ``k1``, ``k2``, ``k3``  hit@1 (the top candidate is held) on the sets of that size
+    ``k23``                 hit@1 on the sets of size 2 and 3 together
+    ``k23_exactk``          exact@k (the top k candidates are exactly the set) on sizes 2 and 3
+    ``k1_margin``           mean margin, min logp(held) − max logp(not held), on the one-object sets
+    ``k23_margin``          the same on sizes 2 and 3
+    ``n_k1``, ``n_k23``     row counts
+
+    Chance on these items (8 objects in play): hit@1 = k/8, exact@k = 1/C(8, k). A size absent from the rows
+    leaves its keys out."""
+    by: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        k = int(r["k"])
+        by.setdefault(f"k{k}", []).append(r)
+        if k > 1:
+            by.setdefault("k23", []).append(r)
+    m: dict[str, float] = {}
+    for name in ("k1", "k2", "k3", "k23"):
+        sub = by.get(name)
+        if not sub:
+            continue
+        m[f"setbind/{name}"] = float(np.mean([r["hit1"] for r in sub]))
+        if name in ("k1", "k23"):
+            m[f"setbind/{name}_margin"] = float(np.mean([r["set_margin"] for r in sub]))
+            m[f"setbind/n_{name}"] = float(len(sub))
+        if name == "k23":
+            m["setbind/k23_exactk"] = float(np.mean([r["exactk"] for r in sub]))
+    return m
 
 
 def _json_default(o: Any) -> Any:

@@ -2238,7 +2238,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inloop_evals", type=str, default=None,
         help="Comma list of in-loop eval suites scored on the live weights: riders "
-             "(riders-lite), induction, uncheatable (needs --inloop_uncheatable_path), "
+             "(riders-lite), setbind (needs --inloop_setbind_items), induction, "
+             "uncheatable (needs --inloop_uncheatable_path), "
              "nca_gates (needs --inloop_nca_gates_dir). Unset/empty = off.",
     )
     p.add_argument(
@@ -2265,6 +2266,9 @@ def parse_args() -> argparse.Namespace:
                    action="store_false", help="Skip the 3shot_relet condition")
     p.add_argument("--inloop_riders_top_n", type=int, default=5,
                    help="Full-vocab top-n tokens kept per rider row")
+    p.add_argument("--inloop_setbind_items", type=str, default=None,
+                   help="Bindprobes items.jsonl for the setbind suite (its static setbind items are scored "
+                        "3-shot; the bp-v3.1 battery gives the benchmark's set-binding k1 read)")
     p.add_argument("--inloop_induction_n_seqs", type=int, default=32)
     p.add_argument("--inloop_induction_len", type=int, default=128,
                    help="Random prefix length (sequence = 2x + EOS)")
