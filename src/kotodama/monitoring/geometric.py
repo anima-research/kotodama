@@ -29,7 +29,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -176,6 +176,16 @@ class _ProbeShard:
         return out[~torch.isnan(out[:, 0])]
 
 
+class _PowerIterResult(NamedTuple):
+    """One EoC power iteration: σ (spectral-radius estimate), the scale-free gain σ·‖h‖/‖f(h)‖, the vector-Jacobian
+    products it took, and its drift |σ_K − σ_⌊K/2⌋| / σ_K (how far σ still moved over the second half of the budget;
+    0 when J annihilated the vector)."""
+    sigma: float
+    gain: float
+    iters: int
+    drift: float
+
+
 class GeometricMonitor:
     """
     Geometric health monitor for transformer pretraining.
@@ -234,9 +244,10 @@ class GeometricMonitor:
         # AttnRes diagnostics (populated during _probe_forward_attn_res)
         self._attn_res_diagnostics: dict[str, float] = {}
 
-        # Warm-start vectors for Jacobian spectral radius (EoC)
-        self._warm_vectors: dict[str, torch.Tensor] = {}
-        self._eoc_call_count: int = 0
+        # EoC power-iteration start vectors, one per global probe shape (see _eoc_start), and their device copies
+        # (this rank's rows) for the sub-layers of one probe point, which share a shape
+        self._eoc_starts: dict[tuple[int, ...], torch.Tensor] = {}
+        self._eoc_dev_starts: dict[tuple[Any, ...], torch.Tensor] = {}
 
         logger.info(
             "GeometricMonitor: %d layers, tier1 layers=%s, tier2 ID layers=%s",
@@ -462,10 +473,10 @@ class GeometricMonitor:
     # =========================================================================
 
     def compute_jacobian_spectral(
-        self, step: int, n_iters: int = 5, n_sequences: int = 4,
+        self, step: int, n_iters: Optional[int] = None, n_sequences: int = 4,
     ) -> dict[str, float]:
         """
-        Compute per-layer Jacobian spectral norm via warm-started power iteration.
+        Compute per-layer Jacobian spectral radius by power iteration (see _power_iterate).
 
         For each sampled layer, estimates σ_max(J_ℓ) where J_ℓ = ∂output/∂input.
         σ_max > 1 → layer amplifies perturbations (chaotic regime).
@@ -475,7 +486,9 @@ class GeometricMonitor:
         For AttnRes models, computes separate σ for attn and MLP sub-layers
         (since they receive independently routed inputs in the actual forward).
 
-        Uses warm-started eigenvectors from previous call for faster convergence.
+        n_iters is the power-iteration budget (default EOC_ITERS). Every call starts
+        from the same seeded vector and runs the same number of steps, so the readout
+        depends only on the model and the probe batch, never on earlier calls.
         """
         if self._probe_batch is None:
             return {}
@@ -497,7 +510,6 @@ class GeometricMonitor:
             with torch.no_grad():
                 hidden_states, _ = self._probe_forward(batch)
 
-            self._eoc_call_count += 1
             metrics.update(self._eoc_metrics(hidden_states, device, n_iters))
             metrics["eoc/time_s"] = time.time() - t0
 
@@ -518,59 +530,75 @@ class GeometricMonitor:
 
         return metrics
 
-    COLD_ITERS = 20      # iterations from a random vector (cold start AND re-randomize)
-    EOC_REL_TOL = 1e-3   # stop once σ changes by less than this (relative)
+    EOC_SEED = 1234        # seed of the dedicated generator that draws the power-iteration start
+    EOC_ITERS = 20         # power-iteration steps (vector-Jacobian products) per probed sub-layer, every call
+    EOC_DRIFT_TOL = 1e-2   # a sub-layer whose σ drifts more than this over the budget's second half is unconverged
+
+    def _eoc_start(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """The power-iteration start for a probe of this GLOBAL shape (EoC sequences, T, D): float32 on the CPU.
+
+        Drawn once per shape from a dedicated CPU generator seeded with EOC_SEED, so it is the same vector at every
+        call, on every rank and at every world size, and drawing it leaves the global CPU and CUDA RNG streams (the
+        training run's randomness) untouched."""
+        v = self._eoc_starts.get(shape)
+        if v is None:
+            gen = torch.Generator(device="cpu").manual_seed(self.EOC_SEED)
+            v = torch.randn(shape, generator=gen, dtype=torch.float32)
+            self._eoc_starts[shape] = v
+        return v
 
     def _power_iterate(
         self,
         h_detached: torch.Tensor,
         layer_fn: Any,
-        warm_key: str,
         device: torch.device,
         n_iters: int,
-    ) -> tuple[float, float]:
+    ) -> _PowerIterResult:
         """Power iteration on the Jacobian J = ∂f/∂h of layer_fn at h_detached.
 
         Iterates vector-Jacobian products only (v ← Jᵀv), so σ is the dominant
         |eigenvalue| of J — the spectral RADIUS, the edge-of-chaos quantity — not
         the spectral norm (that needs Jᵀ J, i.e. forward-mode AD, which the FA4
-        attention path does not support). Returns (σ, relative gain); the
-        relative gain σ·‖h‖/‖f(h)‖ is scale-free (log-log amplification), so layers
-        whose input sits at a very different scale (layer 0 reads the raw embedding)
-        compare with the rest — raw σ there is ~‖W‖/rms(embedding), not chaos.
+        attention path does not support). The relative gain σ·‖h‖/‖f(h)‖ is
+        scale-free (log-log amplification), so layers whose input sits at a very
+        different scale (layer 0 reads the raw embedding) compare with the rest —
+        raw σ there is ~‖W‖/rms(embedding), not chaos.
 
-        Re-randomizes the warm vector every 10 calls to avoid drifting onto a
-        subdominant direction. A random start (cold OR re-randomized) gets
-        COLD_ITERS iterations: the warm budget (5) from scratch under-converges and
-        prints a sawtooth into every σ series (a dip each 10th call, then a creep
-        back up).
-        Iteration stops early once σ is stable to EOC_REL_TOL.
+        Every call starts from the same seeded vector (_eoc_start) and takes exactly
+        n_iters steps, so σ is a fixed, continuous function of the weights and the
+        probe batch. A start vector carried over from earlier calls, or re-drawn on
+        a call-count cadence, makes σ depend on the probe's call history (each redraw
+        steps every series), and a data-dependent early stop makes it jump where the
+        stop moves: σ_k can sit on a transient plateau a few steps in and leave it
+        later, so two nearby weight states that stop on either side of the plateau
+        read σ values apart by the plateau's height.
+
+        A fixed budget does not make σ the true radius: with clustered top
+        eigenvalues (|λ2/λ1| near 1) or a complex dominant pair, power iteration
+        approaches |λ1| slowly or circles it. ``drift`` (|σ_K − σ_⌊K/2⌋| / σ_K) is
+        reported beside σ, so an under-converged reading is visible as one.
         """
         # Sharded: h_detached holds this rank's rows (possibly none). The Jacobian is block-diagonal across sequences,
         # so iterating on every rank's rows with the vector normalized over all of them is the same power iteration;
         # sigma is global, so every rank takes the same number of steps (and collectives).
         shard = self._shard
         has_rows = h_detached.shape[0] > 0
-        cold_start = warm_key not in self._warm_vectors
-        rerandomize = (self._eoc_call_count % 10 == 0) and not cold_start
-
-        v = None if (cold_start or rerandomize) else self._warm_vectors[warm_key].to(device)
-        if v is None or v.shape != h_detached.shape:
-            if shard.on:
-                # The random start the unsharded probe draws (randn over all the EoC sequences, rank 0's CUDA RNG),
-                # broadcast; each rank keeps its rows.
-                full = torch.empty((self._eoc_n_global,) + tuple(h_detached.shape[1:]), device=device,
-                                   dtype=h_detached.dtype)
-                if shard.rank == 0:
-                    full.normal_()
-                v = shard.broadcast_(full)[self._eoc_local_global]
-            else:
-                v = torch.randn_like(h_detached)
-            n_iters = max(n_iters, self.COLD_ITERS)
+        tail = tuple(h_detached.shape[1:])
+        # The unsharded start over all the EoC sequences; sharded, each rank keeps its rows. The device copy is keyed
+        # by everything that determines it, so a cached copy is always the right one.
+        shape = ((self._eoc_n_global,) if shard.on else (h_detached.shape[0],)) + tail
+        rows = tuple(self._eoc_local_global) if shard.on else None
+        key = (shape, rows, str(device))
+        v = self._eoc_dev_starts.get(key)
+        if v is None:
+            v = self._eoc_start(shape)
+            v = (v[list(rows)] if rows is not None else v).to(device)
+            self._eoc_dev_starts[key] = v
         v = v / shard.norm(v)
 
-        sigma, prev = 0.0, None
-        for it in range(n_iters):
+        sigmas: list[float] = []
+        sigma = 0.0
+        for _ in range(n_iters):
             if has_rows:
                 h_input = h_detached.clone().requires_grad_(True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -581,38 +609,38 @@ class GeometricMonitor:
             else:
                 Jt_v = torch.zeros_like(h_detached, dtype=torch.float32)
             sigma = shard.norm(Jt_v).item()
-            if sigma < 1e-10:
+            sigmas.append(sigma)
+            if sigma < 1e-10:  # J annihilated v: σ is 0 and another step would divide by it
                 break
             v = (Jt_v / sigma).detach()
-            if prev is not None and it >= 2 and abs(sigma - prev) <= self.EOC_REL_TOL * sigma:
-                break
-            prev = sigma
+        if sigma < 1e-10:
+            drift = 0.0
+        elif len(sigmas) >= 2:
+            drift = abs(sigma - sigmas[len(sigmas) // 2 - 1]) / sigma
+        else:
+            drift = float("nan")
 
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             out = layer_fn(h_detached).float() if has_rows else torch.zeros(0, device=device)
         out_norm = shard.norm(out).item()
         in_norm = shard.norm(h_detached.float()).item()
         rel = sigma * in_norm / out_norm if out_norm > 0 else float("nan")
-
-        self._warm_vectors[warm_key] = v.cpu()
-        return sigma, rel
+        return _PowerIterResult(sigma, rel, len(sigmas), drift)
 
     def _eoc_metrics(
         self,
         hidden_states: dict[int, torch.Tensor],
         device: torch.device,
-        n_iters: int,
+        n_iters: Optional[int] = None,
         n_seq: Optional[int] = None,
     ) -> dict[str, float]:
-        """Per-layer Jacobian σ (raw) + relative gain, and interior aggregates.
+        """Per-layer Jacobian σ (raw) + relative gain + power-iteration drift, and interior aggregates.
 
-        AttnRes: attn and MLP sub-layers are probed at their own routed inputs
-        (pre-attn from attn_norm, pre-MLP from ffn_norm).
+        n_iters is each power iteration's budget (default EOC_ITERS). AttnRes: attn and
+        MLP sub-layers are probed at their own routed inputs (pre-attn from attn_norm,
+        pre-MLP from ffn_norm).
         """
         metrics: dict[str, float] = {}
-        use_attn_res = getattr(self.model.config, "attn_res", False)
-        rope_cos, rope_sin = self.model.rope_cos, self.model.rope_sin
-        mlp_inputs = getattr(self, "_mlp_inputs", {})
         if n_seq and self._shard.on:
             # The first n_seq probe sequences: the ones of them this rank holds.
             local = [i for i, g in enumerate(self._local_rows) if g < n_seq]
@@ -622,31 +650,12 @@ class GeometricMonitor:
         else:
             cut = (lambda t: t[:n_seq]) if n_seq else (lambda t: t)
 
-        for layer_idx in self.config.tier1_sample_layers:
-            if layer_idx not in hidden_states:
-                continue
-            layer = self.model.layers[layer_idx]
-            h_attn = cut(hidden_states[layer_idx]).detach()
-            base = f"layer_{layer_idx}"
-            if use_attn_res:
-                h_mlp = cut(mlp_inputs.get(layer_idx, hidden_states[layer_idx])).detach()
-                for name, h, fn in [
-                    ("attn", h_attn, lambda h, _l=layer: h + _l.attn(_l.attn_norm(h), rope_cos, rope_sin)),
-                    ("mlp", h_mlp, lambda h, _l=layer: h + _l.ffn(_l.ffn_norm(h))),
-                ]:
-                    sigma, rel = self._power_iterate(h, fn, f"jacobian_v_{layer_idx}_{name}", device, n_iters)
-                    metrics[f"eoc/jacobian_sigma/{base}/{name}"] = sigma
-                    metrics[f"eoc/jacobian_gain/{base}/{name}"] = rel
-                metrics[f"eoc/jacobian_sigma/{base}"] = max(
-                    metrics[f"eoc/jacobian_sigma/{base}/attn"], metrics[f"eoc/jacobian_sigma/{base}/mlp"])
-                metrics[f"eoc/jacobian_gain/{base}"] = max(
-                    metrics[f"eoc/jacobian_gain/{base}/attn"], metrics[f"eoc/jacobian_gain/{base}/mlp"])
-            else:
-                sigma, rel = self._power_iterate(
-                    h_attn, lambda h, _l=layer: _l(h, rope_cos, rope_sin),
-                    f"jacobian_v_{layer_idx}", device, n_iters)
-                metrics[f"eoc/jacobian_sigma/{base}"] = sigma
-                metrics[f"eoc/jacobian_gain/{base}"] = rel
+        budget = self.EOC_ITERS if n_iters is None else n_iters
+        drifts: list[float] = []
+        try:
+            self._eoc_sites(hidden_states, device, budget, cut, metrics, drifts)
+        finally:
+            self._eoc_dev_starts.clear()  # device copies live for one probe point, not between them
 
         # Layer 0 raw σ is an embedding-scale artefact ("Spike No More", Takase et al.
         # COLM 2025): report it apart and keep it out of the raw aggregates. The
@@ -662,13 +671,61 @@ class GeometricMonitor:
                 metrics[f"{agg}_max"] = max(vals)
                 metrics[f"{agg}_min"] = min(vals)
                 metrics[f"{agg}_mean"] = sum(vals) / len(vals)
+        if drifts:
+            # Under-convergence is a reading of its own: the budget, the worst drift, and how many probed
+            # sub-layers drifted past EOC_DRIFT_TOL (a NaN drift, from a 1-step budget, counts as unconverged).
+            metrics["eoc/iters"] = float(budget)
+            metrics["eoc/drift_max"] = max(drifts, key=lambda d: math.inf if math.isnan(d) else d)
+            metrics["eoc/unconverged"] = float(sum(not d <= self.EOC_DRIFT_TOL for d in drifts))
         return metrics
+
+    def _eoc_sites(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        device: torch.device,
+        budget: int,
+        cut: Any,
+        metrics: dict[str, float],
+        drifts: list[float],
+    ) -> None:
+        """Power-iterate every sampled layer (AttnRes: its attn and MLP sub-layers) into metrics; drifts collects
+        each site's drift for the aggregates."""
+        use_attn_res = getattr(self.model.config, "attn_res", False)
+        rope_cos, rope_sin = self.model.rope_cos, self.model.rope_sin
+        mlp_inputs = getattr(self, "_mlp_inputs", {})
+
+        def _record(site: str, r: _PowerIterResult) -> None:
+            metrics[f"eoc/jacobian_sigma/{site}"] = r.sigma
+            metrics[f"eoc/jacobian_gain/{site}"] = r.gain
+            metrics[f"eoc/jacobian_drift/{site}"] = r.drift
+            drifts.append(r.drift)
+
+        for layer_idx in self.config.tier1_sample_layers:
+            if layer_idx not in hidden_states:
+                continue
+            layer = self.model.layers[layer_idx]
+            h_attn = cut(hidden_states[layer_idx]).detach()
+            base = f"layer_{layer_idx}"
+            if use_attn_res:
+                h_mlp = cut(mlp_inputs.get(layer_idx, hidden_states[layer_idx])).detach()
+                for name, h, fn in [
+                    ("attn", h_attn, lambda h, _l=layer: h + _l.attn(_l.attn_norm(h), rope_cos, rope_sin)),
+                    ("mlp", h_mlp, lambda h, _l=layer: h + _l.ffn(_l.ffn_norm(h))),
+                ]:
+                    _record(f"{base}/{name}", self._power_iterate(h, fn, device, budget))
+                metrics[f"eoc/jacobian_sigma/{base}"] = max(
+                    metrics[f"eoc/jacobian_sigma/{base}/attn"], metrics[f"eoc/jacobian_sigma/{base}/mlp"])
+                metrics[f"eoc/jacobian_gain/{base}"] = max(
+                    metrics[f"eoc/jacobian_gain/{base}/attn"], metrics[f"eoc/jacobian_gain/{base}/mlp"])
+            else:
+                _record(base, self._power_iterate(
+                    h_attn, lambda h, _l=layer: _l(h, rope_cos, rope_sin), device, budget))
 
     # =========================================================================
     # Unified monitoring: shared probe forward, all metrics
     # =========================================================================
 
-    def compute_all(self, step: int, n_eoc_iters: int = 5) -> dict[str, float]:
+    def compute_all(self, step: int, n_eoc_iters: Optional[int] = None) -> dict[str, float]:
         """
         Unified geometric monitoring with a single shared probe forward.
 
@@ -781,7 +838,6 @@ class GeometricMonitor:
                 _phase("twonn")
 
             # == Phase 2: EoC Jacobian spectral radius (needs autograd) ==
-            self._eoc_call_count += 1
             metrics.update(self._eoc_metrics(hidden_states, device, n_eoc_iters, n_seq=4))
             _phase("eoc")
 

@@ -83,19 +83,29 @@ def _worker(rank: int, init_file: str, out: dict) -> None:
 
         # EoC power iteration: sharded over sequences == on all of them (both converged)
         A_mix = torch.randn(D, D) * 0.5
+        cpu = torch.device("cpu")
         sharded._eoc_n_global = B
         sharded._eoc_local_global = rows
-        sharded.EOC_REL_TOL = plain.EOC_REL_TOL = 1e-6
-        sig_sh, gain_sh = sharded._power_iterate(X_local, _layer_fn(A_mix), "k", torch.device("cpu"), 400)
-        sig_full, gain_full = plain._power_iterate(X, _layer_fn(A_mix), "k", torch.device("cpu"), 400)
+        sig_sh, gain_sh, it_sh, _ = sharded._power_iterate(X_local, _layer_fn(A_mix), cpu, 400)
+        sig_full, gain_full, it_full, _ = plain._power_iterate(X, _layer_fn(A_mix), cpu, 400)
         assert abs(sig_sh - sig_full) <= 1e-3 * sig_full, (sig_sh, sig_full)
         assert abs(gain_sh - gain_full) <= 1e-3 * gain_full, (gain_sh, gain_full)
+        assert it_sh == it_full, (it_sh, it_full)
+
+        # ... and the SAME iteration, not only the same limit: each rank starts from its rows of the unsharded seeded
+        # start (drawn whole on every rank, no RNG traffic), so a 3-step, unconverged σ agrees to rounding
+        assert torch.equal(sharded._eoc_start((B, T, D))[rows], plain._eoc_start((B, T, D))[rows])
+        short_sh = sharded._power_iterate(X_local, _layer_fn(A_mix), cpu, 3)
+        short_full = plain._power_iterate(X, _layer_fn(A_mix), cpu, 3)
+        assert short_sh.iters == short_full.iters == 3
+        assert abs(short_sh.sigma - short_full.sigma) <= 1e-5 * short_full.sigma, (short_sh, short_full)
+        assert abs(short_sh.sigma - sig_full) > 1e-4 * sig_full  # 3 steps is short of the limit: the start matters
 
         # a rank holding none of the EoC rows still takes part
         empty = X_local[:0] if rank == 1 else X_local
         sharded._eoc_local_global = [] if rank == 1 else rows
-        sig_e, _ = sharded._power_iterate(empty, _layer_fn(A_mix), "e", torch.device("cpu"), 400)
-        sig_r0, _ = plain._power_iterate(X[[0, 2]], _layer_fn(A_mix), "e0", torch.device("cpu"), 400)  # rank 0's rows
+        sig_e = sharded._power_iterate(empty, _layer_fn(A_mix), cpu, 400).sigma
+        sig_r0 = plain._power_iterate(X[[0, 2]], _layer_fn(A_mix), cpu, 400).sigma  # rank 0's rows
         assert abs(sig_e - sig_r0) <= 1e-3 * sig_r0, (sig_e, sig_r0)
 
         # sample_rows draws exactly the unsharded sample (rank 0's randperm over all rows), so order-invariant
