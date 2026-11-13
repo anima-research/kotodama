@@ -11,6 +11,9 @@
 set -euo pipefail
 ARM="$1"; WORLD="$2"; OUT="$3"; DATA="$4"; STEPS="${5:-200}"; shift 5 || shift $#
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Several nodes: node 0 writes train.log, node k train.node<k>.log; only node 0 post-processes.
+LOGSUFFIX=""
+if [ "${NODE_RANK:-0}" != 0 ]; then LOGSUFFIX=".node$NODE_RANK"; fi
 case "$ARM" in
   ddp) MB=2; EXTRA=() ;;
   ddp-mb1) MB=1; EXTRA=() ;;
@@ -31,4 +34,4 @@ echo "fsdp2-gate arm=$ARM world=$WORLD steps=$STEPS micro_batch=$MB schedule=$SC
   --total_steps "$STEPS" --warmup_steps 20 --log_every 1 --norm_gain_every 10 \
   --save_every 0 --save_schedule "$SCHEDULE" --anchor_tokens '' \
   --checkpoint_dir "$OUT" --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-gate-$ARM-w$WORLD" \
-  "$@" 2>&1 | tee "$OUT/train.log"
+  "$@" 2>&1 | tee "$OUT/train${LOGSUFFIX}.log"

@@ -13,6 +13,9 @@
 set -euo pipefail
 ARM="$1"; WORLD="$2"; OUT="$3"; DATA="$4"; STEPS="${5:-150}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Several nodes: node 0 writes train.log, node k train.node<k>.log; only node 0 post-processes.
+LOGSUFFIX=""
+if [ "${NODE_RANK:-0}" != 0 ]; then LOGSUFFIX=".node$NODE_RANK"; fi
 case "$ARM" in
   ddp-mxfp8) EXTRA=(--fp8 --fp8_recipe mxfp8) ;;
   fsdp2-bf16) EXTRA=(--fsdp2) ;;
@@ -28,7 +31,8 @@ echo "fp8-routing-probe arm=$ARM world=$WORLD steps=$STEPS batch=$BATCH"
   --no_geo_monitor --inloop_evals '' --no_attnres_eps_fp64_compat --varlen_dynamic \
   --data_path "$DATA" --micro_batch_size "$MB" --global_batch_tokens "$BATCH" --total_steps "$STEPS" \
   --log_every 10 --norm_gain_every 10 --save_every 0 --save_schedule "$END:$END" --anchor_tokens '' \
-  --checkpoint_dir "$OUT" --checkpoint_shm_dir "/dev/shm/kotodama-fp8-probe-$ARM" 2>&1 | tee "$OUT/train.log"
+  --checkpoint_dir "$OUT" --checkpoint_shm_dir "/dev/shm/kotodama-fp8-probe-$ARM" 2>&1 | tee "$OUT/train${LOGSUFFIX}.log"
+[ "${NODE_RANK:-0}" = 0 ] || exit 0
 source "$ROOT/tools/_env.sh"
 python - "$OUT" "$ARM" <<'EOF'
 import sys

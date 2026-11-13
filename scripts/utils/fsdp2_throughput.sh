@@ -18,6 +18,9 @@
 set -uo pipefail
 WORLD="$1"; OUT="$2"; DATA="$3"; STEPS="${4:-40}"; RUNS="${5:-ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,fsdp2-layer-mxfp8}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Several nodes: node 0 writes train.log, node k train.node<k>.log; only node 0 post-processes.
+LOGSUFFIX=""
+if [ "${NODE_RANK:-0}" != 0 ]; then LOGSUFFIX=".node$NODE_RANK"; fi
 [ -f "$ROOT/site.env" ] && source "$ROOT/site.env"
 MXVENV="${KOTODAMA_MXFP8_VENV:-${KOTODAMA_DATA_ROOT:-}/venv-mxfp8}"
 mkdir -p "$OUT"
@@ -55,10 +58,11 @@ for name in "${LIST[@]}"; do
     --format=csv,noheader,nounits -l 5 > "$OUT/$name/power.csv" 2>/dev/null &
   SAMPLER=$!
   KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
-    --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train.log"
+    --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train${LOGSUFFIX}.log"
   echo "=== $name exit ${PIPESTATUS[0]} $(date -u +%H:%M:%S) ==="
   kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
 done
+[ "${NODE_RANK:-0}" = 0 ] || exit 0
 source "$ROOT/tools/_env.sh"
 python - "$OUT" "$STEPS" "${LIST[@]}" <<'EOF'
 import re, statistics, sys
