@@ -474,6 +474,29 @@ def _guard_worker(rank: int, world: int, init_file: str, duplicate: bool) -> Non
     dist.destroy_process_group()
 
 
+def _guard_failed_collective_worker(rank: int, world: int, init_file: str) -> None:
+    from kotodama.training import train
+
+    _init(rank, world, init_file)
+    real = dist.all_gather
+
+    def broken(outputs, tensor, group=None):  # a failed collective: receive buffers left as they were
+        real(outputs, tensor, group=group)
+        for t in outputs:
+            t.fill_(-1)
+    train.dist.all_gather = broken
+    try:
+        with pytest.raises(RuntimeError, match="communication failure"):
+            train.check_rank_batches_distinct(_batch(0, rank), None, torch.device("cpu"), step=0, micro=0)
+    finally:
+        train.dist.all_gather = real
+    dist.destroy_process_group()
+
+
+def test_rank_data_guard_names_a_failed_collective(tmp_path):
+    _spawn(_guard_failed_collective_worker, 2, tmp_path)
+
+
 @pytest.mark.parametrize("duplicate", [False, True])
 def test_rank_data_guard(duplicate, tmp_path):
     _spawn(_guard_worker, 3, tmp_path, duplicate)

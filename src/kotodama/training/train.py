@@ -176,13 +176,21 @@ def check_rank_batches_distinct(ids: torch.Tensor, group: Any, device: torch.dev
     """The rank-data guard: every data-parallel replica must train on its own micro-batch.
 
     Collective over ``group`` (``None`` = the world): each rank contributes :func:`batch_digest` of the token ids it
-    is about to train on. Raises if two ranks hold the same batch (every rank raises, so none deadlocks waiting).
+    is about to train on, tagged with its rank. Raises if two ranks hold the same batch (every rank raises, so none
+    deadlocks waiting), and raises a distinct error if the gathered tags are wrong (the collective failed).
     Returns the digests in rank order."""
-    mine = torch.tensor([batch_digest(ids)], dtype=torch.int64, device=device)
+    me = dist.get_rank(group)
+    mine = torch.tensor([me, batch_digest(ids)], dtype=torch.int64, device=device)
     world = dist.get_world_size(group)
-    gathered = [torch.empty_like(mine) for _ in range(world)]
+    gathered = [torch.full_like(mine, -1) for _ in range(world)]
     dist.all_gather(gathered, mine, group=group)
-    digests = [int(t.item()) for t in gathered]
+    rows = [t.tolist() for t in gathered]
+    if [r[0] for r in rows] != list(range(world)):
+        # Each slot carries its sender's rank: anything else means the collective itself failed (e.g. a network
+        # error left the receive buffers unwritten), which must not be reported as duplicated data.
+        raise RuntimeError(f"rank-data guard: the all-gather at step {step} micro {micro} returned invalid data "
+                           f"(rank tags {[r[0] for r in rows]}); a communication failure, not a data check")
+    digests = [r[1] for r in rows]
     by_digest: dict[int, list[int]] = {}
     for r, h in enumerate(digests):
         by_digest.setdefault(h, []).append(r)
