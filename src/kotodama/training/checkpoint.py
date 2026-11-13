@@ -740,7 +740,7 @@ class ShardedCheckpointManager(CheckpointManager):
     """Checkpoints of an FSDP2-sharded run, as torch.distributed.checkpoint (DCP) directories.
 
     ``step_XXXXXXXX.dcp/`` holds the sharded model and both optimizers (every rank writes its own shards, so the
-    checkpoint directory must be one filesystem all ranks see) plus ``meta.pt`` (step, tokens, scheduler, data
+    checkpoint directory must be one filesystem all ranks see) plus the :attr:`META` file (step, tokens, scheduler, data
     position and the run's extras, written by rank 0). A save goes to ``<name>.tmp`` and is renamed only once every
     rank has finished, so an interrupted save is never mistaken for a checkpoint. Resume reshards on load, so the
     world size may change between save and resume."""
