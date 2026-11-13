@@ -464,6 +464,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["activation_checkpointing"] = args.activation_checkpointing
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
     model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
+    model_kwargs["attn_res_query_norm"] = getattr(args, "attnres_query_norm", False)
     model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
     model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
@@ -800,6 +801,7 @@ def train(args: argparse.Namespace) -> None:
             muon_fp32_master=getattr(args, "muon_fp32_master", False),
             attn_group=_attn_lr_scaled(args),
             attn_layers=parse_layer_range(getattr(args, "attn_lr_scale_layers", "")),
+            res_query_lr_scale=getattr(args, "attnres_query_lr_scale", 1.0),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -1818,6 +1820,8 @@ def param_checksum_spread(model: torch.nn.Module) -> float:
 
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
+# An AttnRes routing query: plain (``attn_res_query``) or UnitRoutingQuery's direction / temperature.
+_ROUTER_RE = re.compile(r"(attn|mlp|final)_res_query(\.original|\.0\.temperature)?$")
 
 
 def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
@@ -1858,18 +1862,18 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
     keys: list[str] = []
     vals: list[torch.Tensor] = []
     grad_sq: dict[str, list[torch.Tensor]] = {}
-    router_grads: list[torch.Tensor] = []
+    router_grad_sq: dict[str, list[torch.Tensor]] = {}
     for name, p in model.named_parameters():
         m = _LAYER_RE.search(name)
         leaf = name.split(".")[-2] if name.endswith(".weight") else name.split(".")[-1]
-        if name.endswith("res_query"):
-            where = (f"layer_{m.group(1)}/{'attn' if leaf == 'attn_res_query' else 'mlp'}"
-                     if m else "final")
-            keys.append(f"router/{where}/query_norm"); vals.append(p.detach().float().norm())
+        rq = _ROUTER_RE.search(name)
+        if rq:
+            where = f"layer_{m.group(1)}/{rq.group(1)}" if m and rq.group(1) != "final" else "final"
+            # A unit-norm query's magnitude is its temperature (|q| of the direction is not a routing quantity).
+            if rq.group(2) != ".original":
+                keys.append(f"router/{where}/query_norm"); vals.append(p.detach().float().norm())
             if p.grad is not None:
-                g = p.grad.detach().float().norm()
-                keys.append(f"router/{where}/grad_norm"); vals.append(g)
-                router_grads.append(g)
+                router_grad_sq.setdefault(where, []).append(p.grad.detach().float().pow(2).sum())
             continue
         if p.ndim != 2:
             continue
@@ -1884,6 +1888,11 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
             keys.append("weight_rms/embed"); vals.append(p.detach().float().pow(2).mean().sqrt())
     for k, parts in grad_sq.items():
         keys.append(k); vals.append(torch.stack(parts).sum().sqrt())
+    router_grads: list[torch.Tensor] = []
+    for where, parts in router_grad_sq.items():
+        g = torch.stack(parts).sum().sqrt()
+        keys.append(f"router/{where}/grad_norm"); vals.append(g)
+        router_grads.append(g)
     if router_grads:
         keys.append("router/dead_sites")
         vals.append((torch.stack(router_grads) == 0).sum().float())
@@ -2509,6 +2518,18 @@ def parse_args() -> argparse.Namespace:
              "both (default; the lineage before this flag); 'frozen' keeps the gain fixed (1 for a fresh run); "
              "'folded' moves it into the query (q <- q*g, g <- 1; outputs unchanged) and keeps it fixed. A run "
              "switching mode must start from --resume_weights (the optimizer state no longer matches).",
+    )
+    p.add_argument(
+        "--attnres_query_norm", action="store_true",
+        help="AttnRes routing queries as temperature * q / |q| (a learned per-site sharpness and a unit direction; "
+             "the temperature starts at 0, so routing starts uniform as with zero-init queries). New runs only; needs "
+             "--attnres_res_gain folded or frozen.",
+    )
+    p.add_argument(
+        "--attnres_query_lr_scale", type=float, default=1.0,
+        help="AdamW LR multiplier for the AttnRes routing queries (their own group; the temperatures of "
+             "--attnres_query_norm included). A run with a scale != 1 cannot resume a checkpoint built without it "
+             "(the AdamW group count differs).",
     )
     p.add_argument(
         "--attnres_stack_grad_chain", action="store_true",

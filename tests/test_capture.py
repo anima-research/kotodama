@@ -30,8 +30,10 @@ from kotodama.model.capture import (
 BOUNDARIES = [0, 1, 3]  # 3 committed blocks over 6 layers, DD-shape
 
 
-@pytest.fixture(scope="module")
-def model():
+@pytest.fixture(scope="module", params=[False, True], ids=["plain-query", "unit-norm-query"])
+def model(request):
+    """The plain model, and one with unit-norm routing queries (--attnres_query_norm) at nonzero temperatures, so the
+    capture walkers read the parametrized query on non-uniform routes."""
     torch.manual_seed(20260925)
     cfg = KotodamaModelConfig(
         hidden_size=64,
@@ -46,8 +48,14 @@ def model():
         attn_res=True,
         attn_res_boundaries=BOUNDARIES,
         use_liger=False,
+        attn_res_gain="folded" if request.param else "learned",
+        attn_res_query_norm=request.param,
     )
     m = KotodamaModel(cfg)
+    if request.param:
+        with torch.no_grad():
+            for t in m.routing_temperatures():
+                t.copy_(torch.randn(()) * 3)
     m.eval()
     return m
 

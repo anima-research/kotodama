@@ -473,6 +473,11 @@ class Muon(Optimizer):
         return loss
 
 
+# AttnRes routing parameters by name: a plain query or UnitRoutingQuery's direction, and its temperature.
+_RES_QUERY_RE = re.compile(r"_res_query(\.original)?$")
+_RES_TEMP_RE = re.compile(r"_res_query\.0\.temperature$")
+
+
 def build_hybrid_optimizer(
     model: torch.nn.Module,
     muon_lr: float = 0.03,
@@ -488,6 +493,7 @@ def build_hybrid_optimizer(
     muon_fp32_master: bool = False,
     attn_group: bool = False,
     attn_layers: Optional[set[int]] = None,
+    res_query_lr_scale: float = 1.0,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -508,12 +514,21 @@ def build_hybrid_optimizer(
     deeper). Off by default — like the norm group, a two-group Muon state dict cannot resume a
     one-group checkpoint.
 
+    ``res_query_lr_scale`` != 1 puts the AttnRes routing queries in their own AdamW group whose LR is that multiple
+    of the AdamW LR (``lr_scale``, applied by :class:`HybridScheduler`). UnitRoutingQuery temperatures (the
+    ``attn_res_query_norm`` model option) always get their own group, without weight decay (decay would pull every
+    site's sharpness toward uniform routing), at the same ``lr_scale``.
+
     Returns separate optimizers that should both be stepped each training step.
     """
+    if res_query_lr_scale <= 0:
+        raise ValueError(f"res_query_lr_scale must be > 0, got {res_query_lr_scale}")
     muon_params = []
     attn_params = []
     adamw_params = []
     norm_params = []
+    query_params = []
+    temp_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -525,15 +540,21 @@ def build_hybrid_optimizer(
                 attn_params.append(param)
             else:
                 muon_params.append(param)
+        elif _RES_TEMP_RE.search(name):
+            temp_params.append(param)
+        elif res_query_lr_scale != 1.0 and _RES_QUERY_RE.search(name):
+            query_params.append(param)
         elif adamw_no_decay_norms and param.ndim == 1 and name.endswith("norm.weight"):
             norm_params.append(param)
         else:
             adamw_params.append(param)
+    if res_query_lr_scale != 1.0 and not query_params:
+        raise ValueError("res_query_lr_scale != 1 but the model has no AttnRes routing queries")
 
     if attn_group and not attn_params:
         raise ValueError("attn_group=True but no attention projection weights (*.attn.*_proj.weight) found")
     muon_count = sum(p.numel() for p in muon_params) + sum(p.numel() for p in attn_params)
-    adamw_count = sum(p.numel() for p in adamw_params) + sum(p.numel() for p in norm_params)
+    adamw_count = sum(p.numel() for p in adamw_params + norm_params + query_params + temp_params)
     total = muon_count + adamw_count
 
     # Only print on rank 0 (or when not distributed)
@@ -548,6 +569,11 @@ def build_hybrid_optimizer(
         print(f"AdamW params: {adamw_count:>12,} ({adamw_count/total*100:.1f}%)")
         if norm_params:
             print(f"  of which no-decay norm gains: {len(norm_params)} tensors")
+        if query_params:
+            print(f"  of which AttnRes routing queries (LR x{res_query_lr_scale:g}): {len(query_params)} tensors")
+        if temp_params:
+            print(f"  of which AttnRes routing temperatures (no decay, LR x{res_query_lr_scale:g}): "
+                  f"{len(temp_params)} tensors")
 
     muon_groups: Any = muon_params
     if attn_group:
@@ -569,6 +595,10 @@ def build_hybrid_optimizer(
     adamw_groups: list[dict[str, Any]] = [{"params": adamw_params}]
     if norm_params:
         adamw_groups.append({"params": norm_params, "weight_decay": 0.0})
+    if query_params:
+        adamw_groups.append({"params": query_params, "lr_scale": res_query_lr_scale})
+    if temp_params:
+        adamw_groups.append({"params": temp_params, "weight_decay": 0.0, "lr_scale": res_query_lr_scale})
     adamw_opt = MasterAdamW(
         adamw_groups,
         lr=adamw_lr,
@@ -761,7 +791,7 @@ class HybridScheduler:
                      else 1.0)
             group["lr"] = self.muon_base_lr * mult * scale
         for group in self.adamw_opt.param_groups:
-            group["lr"] = self.adamw_base_lr * mult
+            group["lr"] = self.adamw_base_lr * mult * group.get("lr_scale", 1.0)
 
     def get_last_lr(self) -> dict[str, float]:
         muon_lr = (
