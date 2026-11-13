@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import statistics
+import subprocess
 import sys
 import tempfile
 import threading
@@ -89,21 +90,41 @@ def trace_step(step: Callable[[], None]) -> dict[str, float]:
 
 
 class PowerSampler:
-    """Samples power (W) and SM clock (MHz) of the current GPU every ``period`` s on a thread, via torch.cuda (NVML).
-    Silent no-op where NVML is unavailable."""
+    """Samples power (W) and SM clock (MHz) of the current GPU every ``period`` s on a thread, via torch.cuda (NVML
+    bindings) or else nvidia-smi. Reports nothing where neither works."""
 
     def __init__(self, period: float = 0.05) -> None:
         self.period, self.watts, self.mhz = period, [], []
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
 
+    @staticmethod
+    def _read_nvml() -> tuple[float, float]:
+        return torch.cuda.power_draw() / 1e3, float(torch.cuda.clock_rate())
+
+    @staticmethod
+    def _read_smi() -> tuple[float, float]:
+        """nvidia-smi on the physical GPU behind this process's device (CUDA_VISIBLE_DEVICES maps the index)."""
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        idx = visible.split(",")[torch.cuda.current_device()] if visible else str(torch.cuda.current_device())
+        out = subprocess.run(["nvidia-smi", "-i", idx, "--query-gpu=power.draw,clocks.sm",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=True)
+        w, mhz = out.stdout.strip().split(",")
+        return float(w), float(mhz)
+
     def _run(self) -> None:
+        readers = [self._read_nvml, self._read_smi]
         while not self._stop.is_set():
-            try:
-                self.watts.append(torch.cuda.power_draw() / 1e3)
-                self.mhz.append(float(torch.cuda.clock_rate()))
-            except Exception:  # noqa: BLE001 — no NVML: report nothing rather than fail the timing run
+            while readers:
+                try:
+                    w, mhz = readers[0]()
+                    break
+                except Exception:  # noqa: BLE001 — try the next reader; none left: report nothing, keep timing
+                    readers.pop(0)
+            if not readers:
                 return
+            self.watts.append(w)
+            self.mhz.append(mhz)
             time.sleep(self.period)
 
     def __enter__(self) -> "PowerSampler":
