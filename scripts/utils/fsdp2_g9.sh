@@ -18,6 +18,22 @@ GATE="$ROOT/scripts/utils/fsdp2_gate.sh"
 NODES="${NNODES:-1}"; WORLD=$(( NODES * ${NPROC_PER_NODE:-${KOTODAMA_NPROC:-8}} ))
 BASE_PORT="${MASTER_PORT:-29500}"
 HALF=$(( STEPS / 2 ))
+# Point-to-point rails (one NIC on each node per cable) only pair up when GPU i sits beside NIC i on both nodes, i.e.
+# when the nodes run the same GPU indices. If they differ, use only the first listed NIC: one rail every GPU reaches.
+if [ "$NODES" -gt 1 ] && [ -n "${NCCL_IB_HCA:-}" ]; then
+  SETS="$OUT/.gpu-sets-${HEIMDALL_JOB_ID:-run}"
+  mkdir -p "$SETS"
+  echo "${CUDA_VISIBLE_DEVICES:-all}" > "$SETS/node${NODE_RANK:-0}"
+  for _ in $(seq 180); do
+    [ "$(find "$SETS" -name 'node*' | wc -l)" -ge "$NODES" ] && break
+    sleep 1
+  done
+  if [ "$(cat "$SETS"/node* | sort -u | wc -l)" -gt 1 ]; then
+    FIRST="${NCCL_IB_HCA#=}"; FIRST="${FIRST#^}"; FIRST="${FIRST%%,*}"
+    export NCCL_IB_HCA="=$FIRST"
+    echo "g9: GPU sets differ across nodes ($(cat "$SETS"/node* | tr '\n' ' ')); NCCL on one rail: $NCCL_IB_HCA"
+  fi
+fi
 run() {  # run PORT_OFFSET ARM DIR [extra flags]
   local off="$1"; shift
   echo "=== g9 $2 node ${NODE_RANK:-0} $(date -u +%H:%M:%S) ==="
