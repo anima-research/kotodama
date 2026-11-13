@@ -223,10 +223,12 @@ FROZEN_ROUTING_CHECK_STEP = 50
 def frozen_routing_queries(model: torch.nn.Module) -> list[str]:
     """Trainable AttnRes routing queries still exactly zero (their init): the BUG-LEDGER B1 signature, where fp8 +
     DDP + torch.compile gave the pre-MLP queries bit-exact zero gradients. After a few optimizer steps a query
-    that trains has moved off zero. Reads full values (collective on a sharded model)."""
+    that trains has moved off zero. A unit-norm query (``--attnres_query_norm``) starts from a random direction and a
+    zero temperature, so there the temperature is what is checked. Reads full values (collective on a sharded
+    model)."""
     names: list[str] = []
     for name, p in model.named_parameters():
-        if name.endswith("res_query") and p.requires_grad:
+        if (name.endswith("res_query") or name.endswith("res_query.0.temperature")) and p.requires_grad:
             full = p.full_tensor() if is_dtensor(p) else p
             if torch.count_nonzero(full.detach()) == 0:
                 names.append(name)
@@ -536,6 +538,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["activation_checkpointing"] = args.activation_checkpointing
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
     model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
+    model_kwargs["attn_res_query_norm"] = getattr(args, "attnres_query_norm", False)
     model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
     model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
@@ -905,6 +908,7 @@ def train(args: argparse.Namespace) -> None:
             muon_fp32_master=getattr(args, "muon_fp32_master", False),
             attn_group=_attn_lr_scaled(args),
             attn_layers=parse_layer_range(getattr(args, "attn_lr_scale_layers", "")),
+            res_query_lr_scale=getattr(args, "attnres_query_lr_scale", 1.0),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -1992,6 +1996,8 @@ def param_checksum_spread(model: torch.nn.Module) -> float:
 
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
+# An AttnRes routing query: plain (``attn_res_query``) or UnitRoutingQuery's direction / temperature.
+_ROUTER_RE = re.compile(r"(attn|mlp|final)_res_query(\.original|\.0\.temperature)?$")
 
 
 def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
@@ -2036,7 +2042,7 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
     # (key, how, tensor index); how: "norm" = sqrt(sum sq), "rms" = sqrt(mean sq), "sq" = summed into a grad key.
     reads: list[tuple[str, str, int]] = []
     tensors: list[torch.Tensor] = []
-    router_grad_keys: list[str] = []
+    router_grad_keys: dict[str, None] = {}  # ordered set: one key per routing site
 
     def _read(key: str, how: str, t: torch.Tensor) -> None:
         reads.append((key, how, len(tensors)))
@@ -2045,13 +2051,16 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
     for name, p in model.named_parameters():
         m = _LAYER_RE.search(name)
         leaf = name.split(".")[-2] if name.endswith(".weight") else name.split(".")[-1]
-        if name.endswith("res_query"):
-            where = (f"layer_{m.group(1)}/{'attn' if leaf == 'attn_res_query' else 'mlp'}"
-                     if m else "final")
-            _read(f"router/{where}/query_norm", "norm", p)
+        rq = _ROUTER_RE.search(name)
+        if rq:
+            where = f"layer_{m.group(1)}/{rq.group(1)}" if m and rq.group(1) != "final" else "final"
+            # A unit-norm query's magnitude is its temperature (|q| of the direction is not a routing quantity).
+            if rq.group(2) != ".original":
+                _read(f"router/{where}/query_norm", "norm", p)
             if p.grad is not None:
-                _read(f"router/{where}/grad_norm", "norm", p.grad)
-                router_grad_keys.append(f"router/{where}/grad_norm")
+                # A site's grad norm covers all of its parts (a unit-norm query: direction and temperature).
+                _read(f"router/{where}/grad_norm", "sq", p.grad)
+                router_grad_keys[f"router/{where}/grad_norm"] = None
             continue
         if p.ndim != 2:
             continue
@@ -2208,6 +2217,8 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
         "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
         "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
+        "--attnres_query_norm (its routing temperatures are 0-dim parameters, which fully_shard cannot shard)":
+            getattr(args, "attnres_query_norm", False),
     }
     bad = [name for name, on in unsupported.items() if on]
     if bad:
@@ -2783,6 +2794,18 @@ def parse_args() -> argparse.Namespace:
              "both (default; the lineage before this flag); 'frozen' keeps the gain fixed (1 for a fresh run); "
              "'folded' moves it into the query (q <- q*g, g <- 1; outputs unchanged) and keeps it fixed. A run "
              "switching mode must start from --resume_weights (the optimizer state no longer matches).",
+    )
+    p.add_argument(
+        "--attnres_query_norm", action="store_true",
+        help="AttnRes routing queries as temperature * q / |q| (a learned per-site sharpness and a unit direction; "
+             "the temperature starts at 0, so routing starts uniform as with zero-init queries). New runs only; needs "
+             "--attnres_res_gain folded or frozen.",
+    )
+    p.add_argument(
+        "--attnres_query_lr_scale", type=float, default=1.0,
+        help="AdamW LR multiplier for the AttnRes routing queries (their own group; the temperatures of "
+             "--attnres_query_norm included). A run with a scale != 1 cannot resume a checkpoint built without it "
+             "(the AdamW group count differs).",
     )
     p.add_argument(
         "--attnres_stack_grad_chain", action="store_true",

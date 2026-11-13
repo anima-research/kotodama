@@ -41,21 +41,23 @@ LR = dict(muon_lr=0.02, adamw_lr=1e-3, muon_fp32_master=True, adamw_no_decay_nor
 BATCH, SEQ = 2, 24
 
 
-def _cfg() -> KotodamaModelConfig:
-    # q 128 / kv 64 / ffn 320 / vocab 256 rows: none divides by 3.
+def _cfg(query_norm: bool = False) -> KotodamaModelConfig:
+    # q 128 / kv 64 / ffn 320 / vocab 256 rows: none divides by 3. query_norm: unit-norm routing queries (a direction
+    # and a 0-dim temperature per site), which need a folded gain.
+    extra = dict(attn_res_query_norm=True, attn_res_gain="folded") if query_norm else {}
     return KotodamaModelConfig(hidden_size=128, num_layers=6, num_attention_heads=2, num_kv_heads=1, head_dim=64,
                                intermediate_size=320, vocab_size=256, max_position_embeddings=64, attn_res=True,
                                attn_res_boundaries=[0, 1, 3, 5], loop_start=1, loop_len=2, loop_times=2,
-                               attn_impl="sdpa")
+                               attn_impl="sdpa", **extra)
 
 
-def _reference() -> KotodamaModel:
+def _reference(query_norm: bool = False) -> KotodamaModel:
     torch.manual_seed(0)
-    model = KotodamaModel(_cfg())
-    with torch.no_grad():  # non-trivial routing (fresh queries are zero)
+    model = KotodamaModel(_cfg(query_norm))
+    with torch.no_grad():  # non-trivial routing (fresh queries, or fresh temperatures, are zero)
         for name, p in model.named_parameters():
-            if name.endswith("res_query") and p.requires_grad:
-                p.normal_(0.0, 0.05)
+            if (name.endswith("res_query") or name.endswith("res_query.0.temperature")) and p.requires_grad:
+                p.normal_(0.0 if p.ndim else 1.0, 0.05 if p.ndim else 0.2)
     return model
 
 
@@ -148,14 +150,14 @@ def test_sharded_newton_schulz_is_bitwise_replicated(world, tmp_path):
 # ── the model, sharded vs unsharded ──────────────────────────────────────────
 
 
-def _parity_worker(rank: int, world: int, init_file: str) -> None:
+def _parity_worker(rank: int, world: int, init_file: str, query_norm: bool = False) -> None:
     from torch.distributed.device_mesh import init_device_mesh
 
     from kotodama.training.train import _layer_health_metrics, _norm_gain_metrics, _per_layer_grad_norms
 
     _init(rank, world, init_file)
-    cfg = _cfg()
-    ref = _reference()
+    cfg = _cfg(query_norm)
+    ref = _reference(query_norm)
     reordered = copy.deepcopy(ref)
     unrolled = copy.deepcopy(ref)
     for i in range(cfg.num_layers):  # an un-aliased copy: every loop pass gets its own modules
@@ -232,8 +234,13 @@ def _parity_worker(rank: int, world: int, init_file: str) -> None:
     dist.destroy_process_group()
 
 
-def test_fsdp2_matches_unsharded_model(tmp_path):
-    _spawn(_parity_worker, 3, tmp_path)
+@pytest.mark.parametrize("query_norm", [
+    False,
+    pytest.param(True, marks=pytest.mark.xfail(strict=True, reason="fully_shard cannot shard the 0-dim routing "
+                                               "temperatures; --fsdp2 refuses --attnres_query_norm until they are 1-D")),
+], ids=["plain-queries", "unit-norm-queries"])
+def test_fsdp2_matches_unsharded_model(query_norm, tmp_path):
+    _spawn(_parity_worker, 3, tmp_path, query_norm)
 
 
 # ── deferred gradient sync ───────────────────────────────────────────────────
@@ -538,6 +545,15 @@ def test_frozen_routing_queries_reads_the_b1_signature():
                 p.fill_(0.1)
     assert frozen_routing_queries(model) and all(".mlp_res_query" in n for n in frozen_routing_queries(model))
 
+    unit = KotodamaModel(_cfg(query_norm=True))  # random directions, zero temperatures
+    frozen = frozen_routing_queries(unit)
+    assert frozen and all(n.endswith("res_query.0.temperature") for n in frozen)
+    with torch.no_grad():
+        for name, p in unit.named_parameters():
+            if name.endswith("res_query.0.temperature") and "mlp_res_query" not in name:
+                p.fill_(0.5)
+    assert frozen_routing_queries(unit) and all("mlp_res_query" in n for n in frozen_routing_queries(unit))
+
 
 def test_fsdp2_flag_refuses_unsupported_combinations():
     import argparse
@@ -549,7 +565,8 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
     validate_fsdp2_args(ok)
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "inloop_evals": "riders,induction"}))
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "fp8": True, "fp8_recipe": "mxfp8"}))
-    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True)):
+    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True),
+                dict(attnres_query_norm=True)):
         with pytest.raises(ValueError, match="does not support"):
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):

@@ -124,6 +124,20 @@ def _init_fa4() -> bool:
 
 
 ATTN_RES_GAIN_MODES = ("learned", "frozen", "folded")
+
+
+class UnitRoutingQuery(nn.Module):
+    """Parametrization of an AttnRes routing query as ``temperature * q / |q|``: the direction and the sharpness are
+    separate parameters (routing's analogue of QK-norm). The temperature starts at 0, so routing starts uniform, as a
+    zero-init query does; the direction gets its gradient once the temperature moves off 0."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.temperature = nn.Parameter(torch.zeros(()))
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        norm = q.float().norm().clamp_min(1e-12)
+        return (self.temperature.float() * q.float() / norm).to(q.dtype)
 LIGER_RMSNORM_TUNED_SCOPES = ("all", "qk")
 
 
@@ -174,6 +188,10 @@ class KotodamaModelConfig:
     # loaded, value is kept). "folded": fold_attn_res_gains() moves the gain into the query (q <- q*g, g <- 1) and the
     # gain is not trained; outputs are unchanged by the fold. Fresh runs: frozen == folded (the gain starts at 1).
     attn_res_gain: str = "learned"
+    # Each routing query as temperature * q / |q| (UnitRoutingQuery): a learned per-site sharpness and a unit
+    # direction. Fresh runs only (the parameter names differ from a plain query's); pair with attn_res_gain "folded"
+    # or "frozen" so the gain cannot rescale the direction.
+    attn_res_query_norm: bool = False
     # Looped depth: effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
     # and FFN weights of the core [loop_start, loop_start + loop_len), run loop_times times. num_layers stays the
     # EFFECTIVE depth (AttnRes masks/boundaries, KV caches and capture all see one layer per position); each
@@ -188,6 +206,9 @@ class KotodamaModelConfig:
                              f"expected one of {LIGER_RMSNORM_TUNED_SCOPES}")
         if self.attn_res_gain not in ATTN_RES_GAIN_MODES:
             raise ValueError(f"attn_res_gain={self.attn_res_gain!r}; expected one of {ATTN_RES_GAIN_MODES}")
+        if self.attn_res_query_norm and self.attn_res_gain == "learned":
+            raise ValueError("attn_res_query_norm needs attn_res_gain 'folded' or 'frozen' (a learned gain rescales the "
+                             "unit direction per channel)")
         if self.loop_start is not None:
             end = self.loop_start + self.loop_len * self.loop_times
             if self.loop_start < 0 or self.loop_len < 1 or self.loop_times < 2 or end > self.num_layers:
@@ -1052,6 +1073,8 @@ class KotodamaModel(nn.Module):
         # Initialize weights
         if init_weights:
             self._init_weights()
+        if config.attn_res and config.attn_res_query_norm:
+            self._parametrize_routing_queries()
 
     def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
         super()._apply(fn, recurse)
@@ -1591,6 +1614,37 @@ class KotodamaModel(nn.Module):
         pairs.append((self.final_res_query, self.final_res_norm))
         return pairs
 
+    def _routing_sites(self) -> list[tuple[nn.Module, str]]:
+        """(module, attribute) of every AttnRes routing query: two per layer plus the final aggregation."""
+        sites: list[tuple[nn.Module, str]] = []
+        for layer in self.layers:
+            sites += [(layer, "attn_res_query"), (layer, "mlp_res_query")]
+        sites.append((self, "final_res_query"))
+        return sites
+
+    def _parametrize_routing_queries(self) -> None:
+        """Register UnitRoutingQuery on every routing query. Directions are drawn from a generator seeded off
+        torch.initial_seed(), so the global RNG (and with it every other weight's init) is the same as without the
+        option. A frozen query (the first boundary's pre-attn site) keeps its temperature frozen too."""
+        from torch.nn.utils import parametrize
+
+        gen = torch.Generator().manual_seed(torch.initial_seed() + 0x5EED)
+        for module, attr in self._routing_sites():
+            q = getattr(module, attr)
+            with torch.no_grad():
+                d = torch.randn(q.shape, generator=gen, dtype=torch.float32)
+                q.copy_((d / d.norm()).to(q.dtype))
+            frozen = not q.requires_grad
+            parametrize.register_parametrization(module, attr, UnitRoutingQuery())
+            if frozen:
+                module.parametrizations[attr][0].temperature.requires_grad_(False)
+
+    def routing_temperatures(self) -> list[nn.Parameter]:
+        """The UnitRoutingQuery temperatures (empty unless attn_res_query_norm)."""
+        if not (self.config.attn_res and self.config.attn_res_query_norm):
+            return []
+        return [module.parametrizations[attr][0].temperature for module, attr in self._routing_sites()]
+
     @torch.no_grad()
     def fold_attn_res_gains(self) -> int:
         """Move each routing site's res_norm gain into its query: q <- q * g (rounded once, into q's dtype — the same
@@ -1601,7 +1655,10 @@ class KotodamaModel(nn.Module):
             w = norm.weight
             if not bool((w == 1).all()):
                 changed += 1
-            query.copy_(query * w)
+                if self.config.attn_res_query_norm:
+                    raise ValueError("fold_attn_res_gains: a gain != 1 cannot fold into a unit-norm routing query")
+            if not self.config.attn_res_query_norm:
+                query.copy_(query * w)
             w.fill_(1.0)
         return changed
 
@@ -1634,14 +1691,21 @@ class KotodamaModel(nn.Module):
             for i in idx:
                 layer = self.layers[i]
                 for site in ("attn", "mlp"):
-                    getattr(layer, f"{site}_res_query").zero_()
+                    self._reset_query(layer, f"{site}_res_query")
                     getattr(layer, f"{site}_res_norm").weight.fill_(1.0)
                     reset += [f"layers.{i}.{site}_res_query", f"layers.{i}.{site}_res_norm.weight"]
             if final:
-                self.final_res_query.zero_()
+                self._reset_query(self, "final_res_query")
                 self.final_res_norm.weight.fill_(1.0)
                 reset += ["final_res_query", "final_res_norm.weight"]
         return reset
+
+    def _reset_query(self, module: nn.Module, attr: str) -> None:
+        """Uniform routing at one site: a zero query, or (unit-norm queries) a zero temperature."""
+        if self.config.attn_res_query_norm:
+            module.parametrizations[attr][0].temperature.zero_()
+        else:
+            getattr(module, attr).zero_()
 
     def reinit_embeddings(self, new_vocab_size: Optional[int] = None) -> None:
         """Reinitialize embedding layer. Used when switching from NCA to language vocab."""
