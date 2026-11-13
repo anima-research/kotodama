@@ -15,7 +15,8 @@ mkdir -p "$OUT"
 export KOTODAMA_NPROC="$WORLD"
 COMMON=(--config "$ROOT/configs/tsumugi-1b.yaml" --no_geo_monitor --inloop_evals '' --mix_fraction 0
         --no_attnres_eps_fp64_compat --data_path "$DATA" --global_batch_tokens 2097152 --total_steps "$STEPS"
-        --log_every 5 --norm_gain_every 0 --save_every 0 --save_schedule '' --anchor_tokens '' --time_optimizer_step)
+        --log_every 5 --norm_gain_every 0 --save_every 0 --save_schedule '' --anchor_tokens '' --time_optimizer_step
+        --varlen_dynamic)
 IFS=, read -ra LIST <<< "$RUNS"
 for name in "${LIST[@]}"; do
   case "$name" in
