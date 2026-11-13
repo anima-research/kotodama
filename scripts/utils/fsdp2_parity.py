@@ -30,7 +30,7 @@ from pathlib import Path
 import torch
 
 STEP_RE = re.compile(r"step=(\d+)/\d+ \| loss=([0-9.]+) .*?grad_norm=([0-9.]+)")
-HASH_RE = re.compile(r"batch-hash step=(\d+) micro=(\d+) shape=\S+ digests=(\S+)")
+HASH_RE = re.compile(r"batch-hash step=(\d+) micro=(\d+) shape=\([^)]*\) digests=(\S+)")
 
 
 def read_log(path: Path) -> tuple[dict[int, tuple[float, float]], dict[tuple[int, int], list[str]]]:
