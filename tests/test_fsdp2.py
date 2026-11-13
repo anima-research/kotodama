@@ -263,6 +263,33 @@ def test_deferred_grad_sync_matches_per_micro_sync(tmp_path):
     _spawn(_defer_worker, 3, tmp_path)
 
 
+# ── one group per layer ──────────────────────────────────────────────────────
+
+
+def _grouped_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import fsdp_layer_groups
+
+    _init(rank, world, init_file)
+    ref = _reference()
+    assert len(fsdp_layer_groups(ref)) == ref.config.num_unique_layers
+    model = copy.deepcopy(ref)
+    params_to_fp32(model)
+    apply_fsdp2(model, init_device_mesh("cpu", (world,)), param_dtype=None, group_layers=True)
+    _mean_loss(ref, 0, range(world)).backward()
+    model(_batch(0, rank), labels=_batch(0, rank))["loss"].backward()
+    ref_params = dict(ref.named_parameters())
+    for name, p in model.named_parameters():
+        if ref_params[name].grad is not None:
+            assert _rel(_full(p.grad), ref_params[name].grad) < 1e-5, name
+    dist.destroy_process_group()
+
+
+def test_layer_groups_match_unsharded(tmp_path):
+    _spawn(_grouped_worker, 3, tmp_path)
+
+
 # ── compile inside the units ─────────────────────────────────────────────────
 
 

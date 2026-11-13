@@ -125,6 +125,22 @@ def fsdp_units(model: nn.Module) -> list[nn.Module]:
     return units
 
 
+def fsdp_layer_groups(model: nn.Module) -> list[list[nn.Module]]:
+    """The units grouped per unique layer: ``[attn, ffn]`` of every layer whose modules are not loop repeats, in
+    layer order. One ``fully_shard`` call per group gathers and reshards the layer's attention and FFN weights
+    together (half the hook calls and collectives of one unit per module)."""
+    groups: list[list[nn.Module]] = []
+    seen: set[int] = set()
+    for i, layer in enumerate(model.layers):  # type: ignore[attr-defined]
+        a, f = id(layer.attn), id(layer.ffn)
+        if (a in seen) != (f in seen):
+            raise ValueError(f"layer {i}: attn and ffn are not shared together; cannot group them")
+        if a not in seen:
+            seen.update((a, f))
+            groups.append([layer.attn, layer.ffn])
+    return groups
+
+
 @torch.no_grad()
 def params_to_fp32(model: nn.Module) -> int:
     """Turn every floating-point parameter into fp32 in place (buffers keep their dtype). On a bf16 model this
@@ -157,12 +173,14 @@ def apply_fsdp2(
     param_dtype: Optional[torch.dtype] = torch.bfloat16,
     reduce_dtype: torch.dtype = torch.float32,
     reshard_after_forward: bool = True,
+    group_layers: bool = False,
 ) -> list[nn.Module]:
     """Shard ``model`` in place per the module docstring's plan; returns the non-root units.
 
     Call after every weight is loaded and every parameter's ``requires_grad`` is final, and after
     :func:`params_to_fp32`. ``param_dtype=None`` computes in the parameters' own dtype (tests compare against an
-    fp32 reference that way)."""
+    fp32 reference that way). ``group_layers`` shards each unique layer's attention and FFN as one group
+    (:func:`fsdp_layer_groups`) instead of one unit per module."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     for name, p in model.named_parameters():
@@ -171,7 +189,8 @@ def apply_fsdp2(
                              "the fp32 masters)")
     mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False)
     units = fsdp_units(model)
-    for unit in units:
+    shard_calls: list[Any] = fsdp_layer_groups(model) if group_layers else units
+    for unit in shard_calls:
         fully_shard(unit, mesh=mesh, mp_policy=mp, reshard_after_forward=reshard_after_forward)
     fully_shard(model, mesh=mesh, mp_policy=mp, reshard_after_forward=reshard_after_forward)
     return units

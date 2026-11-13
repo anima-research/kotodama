@@ -2,14 +2,15 @@
 # G8: FSDP2 vs DDP throughput at the kotodama-tsumugi production recipe (compiled, 2M-token batch, 4K context) on
 # one node. Runs, in order, each STEPS steps with the optimizer step timed (--time_optimizer_step) and telemetry
 # readers off in every arm: ddp (micro-batch 8), fsdp2 (8), fsdp2 without reshard-after-forward (8), fsdp2 with
-# the gradient reduce-scatter deferred to each step's last micro-step (8), fsdp2 (16).
+# the gradient reduce-scatter deferred to each step's last micro-step (8), fsdp2 with one unit per layer (8),
+# fsdp2 (16).
 # Each run's log is OUT/<name>/train.log; the summary (mean tok/s, MFU, optimizer share and peak memory over the
 # second half of the steps) is printed at the end and written to OUT/summary.md.
 #
 # Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS]
-#   RUNS: comma list from ddp,fsdp2,fsdp2-zero2,fsdp2-defer,fsdp2-mb16 (default: all five)
+#   RUNS: comma list from ddp,fsdp2,fsdp2-zero2,fsdp2-defer,fsdp2-layer,fsdp2-mb16 (default: all six)
 set -uo pipefail
-WORLD="$1"; OUT="$2"; DATA="$3"; STEPS="${4:-40}"; RUNS="${5:-ddp,fsdp2,fsdp2-zero2,fsdp2-defer,fsdp2-mb16}"
+WORLD="$1"; OUT="$2"; DATA="$3"; STEPS="${4:-40}"; RUNS="${5:-ddp,fsdp2,fsdp2-zero2,fsdp2-defer,fsdp2-layer,fsdp2-mb16}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p "$OUT"
 export KOTODAMA_NPROC="$WORLD"
@@ -24,6 +25,7 @@ for name in "${LIST[@]}"; do
     fsdp2) EXTRA=(--fsdp2 --micro_batch_size 8) ;;
     fsdp2-zero2) EXTRA=(--fsdp2 --no_fsdp2_reshard_after_forward --micro_batch_size 8) ;;
     fsdp2-defer) EXTRA=(--fsdp2 --fsdp2_defer_grad_sync --micro_batch_size 8) ;;
+    fsdp2-layer) EXTRA=(--fsdp2 --fsdp2_group_layers --micro_batch_size 8) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
     *) echo "unknown run $name" >&2; exit 2 ;;
   esac

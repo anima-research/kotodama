@@ -693,6 +693,7 @@ def train(args: argparse.Namespace) -> None:
         fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
         _units = apply_fsdp2(model, fsdp_mesh,
                              reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True),
+                             group_layers=getattr(args, "fsdp2_group_layers", False),
                              reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
                                            else torch.float32))
         if is_main:
@@ -2639,6 +2640,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_fsdp2_reshard_after_forward", dest="fsdp2_reshard_after_forward", action="store_false",
         help="Turn off --fsdp2_reshard_after_forward.",
+    )
+    p.add_argument(
+        "--fsdp2_group_layers", action="store_true",
+        help="With --fsdp2: shard each unique layer's attention and FFN as one group (gathered and resharded "
+             "together) instead of one unit per module: half the hook calls and collectives.",
     )
     p.add_argument(
         "--fsdp2_reduce_dtype", choices=("fp32", "bf16"), default="fp32",
