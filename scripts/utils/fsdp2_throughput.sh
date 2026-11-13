@@ -7,14 +7,17 @@
 # fsdp2-layer-mxfp8 (MXFP8 matmuls; runs in the venv at $KOTODAMA_MXFP8_VENV, default <data root>/venv-mxfp8,
 # whose torchao carries the CUDA mxfp8 kernels; skipped if absent). Also
 # available: fsdp2-zero2, fsdp2-defer (reduce-scatter deferred to a step's last micro-step), fsdp2-mb16.
+# Under a multi-node launch (the scheduler sets NNODES > 1) every fsdp2 run is HSDP, sharded within a node and
+# replicated across nodes (--fsdp2_replicas NNODES), except fsdp2-layer-flat, which shards one layer per group over
+# every rank of every node. Interconnect settings (e.g. NCCL_IB_HCA) come from the environment.
 # Each run's log is OUT/<name>/train.log and its GPU power / SM clock / throttle reasons, sampled every 5 s, are
-# OUT/<name>/power.csv; the summary (over the second half of the steps: mean tok/s, MFU, optimizer share, peak
-# memory, mean power and clock, and the share of samples throttled by the software power cap, bit 0x4) is printed at
-# the end and written to OUT/summary.md.
+# OUT/<name>/power.csv, for the job's own GPUs (node k: train.node<k>.log, power.node<k>.csv). The summary (over the
+# second half of the steps: mean tok/s, MFU, optimizer share, peak memory, mean power and clock, and the share of
+# samples throttled by the software power cap, bit 0x4) is printed at the end and written to OUT/summary.md.
 #
 # Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS]
 #   RUNS: comma list of run names (default: ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,
-#         fsdp2-layer-mxfp8)
+#         fsdp2-layer-mxfp8; also fsdp2-zero2, fsdp2-defer, fsdp2-mb16, fsdp2-layer-flat)
 set -uo pipefail
 WORLD="$1"; OUT="$2"; DATA="$3"; STEPS="${4:-40}"; RUNS="${5:-ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,fsdp2-layer-mxfp8}"
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -25,6 +28,9 @@ if [ "${NODE_RANK:-0}" != 0 ]; then LOGSUFFIX=".node$NODE_RANK"; fi
 MXVENV="${KOTODAMA_MXFP8_VENV:-${KOTODAMA_DATA_ROOT:-}/venv-mxfp8}"
 mkdir -p "$OUT"
 export KOTODAMA_NPROC="$WORLD"
+NODES="${NNODES:-1}"; BASE_PORT="${MASTER_PORT:-29500}"; PORT_OFF=0
+REPL=()
+if [ "$NODES" -gt 1 ]; then REPL=(--fsdp2_replicas "$NODES"); fi
 COMMON=(--config "$ROOT/configs/tsumugi-1b.yaml" --no_geo_monitor --inloop_evals '' --mix_fraction 0
         --no_attnres_eps_fp64_compat --data_path "$DATA" --global_batch_tokens 2097152 --total_steps "$STEPS"
         --log_every 5 --norm_gain_every 0 --save_every 0 --save_schedule '' --anchor_tokens '' --time_optimizer_step
@@ -42,8 +48,12 @@ for name in "${LIST[@]}"; do
     fsdp2-layer-mb16) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 16) ;;
     fsdp2-layer-mxfp8) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
+    fsdp2-layer-flat) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8) ;;
     *) echo "unknown run $name" >&2; exit 2 ;;
   esac
+  if [[ "$name" == fsdp2* && "$name" != *-flat ]]; then EXTRA+=("${REPL[@]}"); fi
+  # A fresh rendezvous port per run, so a run never meets the previous one's socket still closing.
+  PORT_OFF=$((PORT_OFF + 1)); export MASTER_PORT=$((BASE_PORT + PORT_OFF))
   RUN_VENV="${KOTODAMA_VENV:-}"
   if [[ "$name" == *mxfp8* ]]; then
     if [ ! -x "$MXVENV/bin/python" ]; then
@@ -54,8 +64,8 @@ for name in "${LIST[@]}"; do
   fi
   mkdir -p "$OUT/$name"
   echo "=== $name $(date -u +%H:%M:%S) ==="
-  nvidia-smi --query-gpu=timestamp,index,power.draw,clocks.sm,clocks_throttle_reasons.active \
-    --format=csv,noheader,nounits -l 5 > "$OUT/$name/power.csv" 2>/dev/null &
+  nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "$CUDA_VISIBLE_DEVICES"} \
+    --query-gpu=timestamp,index,power.draw,clocks.sm,clocks_throttle_reasons.active --format=csv,noheader,nounits -l 5 > "$OUT/$name/power${LOGSUFFIX}.csv" 2>/dev/null &
   SAMPLER=$!
   KOTODAMA_SCHEDULER_METRIC_PREFIX="$name" KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
     --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train${LOGSUFFIX}.log"
