@@ -1310,6 +1310,7 @@ def train(args: argparse.Namespace) -> None:
     # Rank-data guard (check_rank_batches_distinct) for the first --rank_data_guard_steps steps of every launch.
     # KOTODAMA_DEBUG_BATCH_HASH=N also logs every rank's batch digests for steps < N (comparable across runs).
     _guard_steps = int(getattr(args, "rank_data_guard_steps", 20) or 0)
+    _fsdp2_defer = bool(getattr(args, "fsdp2_defer_grad_sync", False))
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
 
     for step in range(start_step, loop_end):
@@ -1380,7 +1381,9 @@ def train(args: argparse.Namespace) -> None:
             )
 
             # Skip gradient sync on all but the last micro-step.
-            # no_sync() only exists on DDP-wrapped models.
+            # no_sync() only exists on DDP-wrapped models; FSDP2 defers its reduce-scatter on request.
+            if use_fsdp2 and _fsdp2_defer:
+                model.set_requires_gradient_sync(micro_step == current_grad_accum - 1)
             sync_ctx = (
                 model.no_sync()
                 if hasattr(model, "no_sync") and micro_step < current_grad_accum - 1
@@ -2633,6 +2636,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_fsdp2_reshard_after_forward", dest="fsdp2_reshard_after_forward", action="store_false",
         help="Turn off --fsdp2_reshard_after_forward.",
+    )
+    p.add_argument(
+        "--fsdp2_defer_grad_sync", action="store_true",
+        help="With --fsdp2: reduce-scatter gradients only on a step's last micro-step (like DDP's no_sync): one "
+             "collective round per step instead of one per micro-step, at the cost of holding unsharded "
+             "gradients (accumulated in the compute dtype) across the micro-steps.",
     )
     p.add_argument(
         "--time_optimizer_step", action="store_true",

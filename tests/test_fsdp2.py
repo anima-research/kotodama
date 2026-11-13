@@ -236,6 +236,33 @@ def test_fsdp2_matches_unsharded_model(tmp_path):
     _spawn(_parity_worker, 3, tmp_path)
 
 
+# ── deferred gradient sync ───────────────────────────────────────────────────
+
+
+def _defer_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    ref = _reference()
+    every, deferred = _sharded(ref, mesh), _sharded(ref, mesh)
+    micros = 3
+    for m, defer in ((every, False), (deferred, True)):
+        for k in range(micros):
+            if defer:
+                m.set_requires_gradient_sync(k == micros - 1)
+            ids = _batch(k, rank)
+            (m(ids, labels=ids)["loss"] / micros).backward()
+    for (name, p), q in zip(every.named_parameters(), deferred.parameters()):
+        if p.grad is not None:
+            assert _rel(_full(q.grad), _full(p.grad)) < 1e-5, name
+    dist.destroy_process_group()
+
+
+def test_deferred_grad_sync_matches_per_micro_sync(tmp_path):
+    _spawn(_defer_worker, 3, tmp_path)
+
+
 # ── compile inside the units ─────────────────────────────────────────────────
 
 
