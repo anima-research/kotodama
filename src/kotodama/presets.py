@@ -62,6 +62,10 @@ SHAPES: dict[str, dict[str, Any]] = {
     "10b-bench-spire": dict(hidden_size=3072, num_layers=140, num_attention_heads=24,
                             num_kv_heads=12, head_dim=128, intermediate_size=8192,
                             loop_start=30, loop_len=40, loop_times=2, **_COMMON),
+    # A 48-layer, unlooped slice of 10b-bench-loop's width (~6.9B): small enough for one GPU with sharded-optimizer
+    # state, for comparing the training stack's per-GPU speed against a bare forward+backward of the same layers.
+    "10b-bench-slice": dict(hidden_size=3584, num_layers=48, num_attention_heads=28,
+                            num_kv_heads=14, head_dim=128, intermediate_size=9472, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — between the proxy and the 1b.
     "intermediate": dict(hidden_size=1024, num_layers=28, num_attention_heads=8,
                          num_kv_heads=4, head_dim=128, intermediate_size=2816, **_COMMON),
