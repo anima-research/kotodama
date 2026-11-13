@@ -474,6 +474,19 @@ def test_rank_data_guard(duplicate, tmp_path):
     _spawn(_guard_worker, 3, tmp_path, duplicate)
 
 
+def test_frozen_routing_queries_reads_the_b1_signature():
+    from kotodama.training.train import frozen_routing_queries
+
+    model = KotodamaModel(_cfg())  # fresh queries are zero; the first boundary layer's pre-attn one is frozen
+    frozen = frozen_routing_queries(model)
+    assert "layers.0.attn_res_query" not in frozen and "layers.1.mlp_res_query" in frozen
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("res_query") and ".mlp_" not in name:
+                p.fill_(0.1)
+    assert frozen_routing_queries(model) and all(".mlp_res_query" in n for n in frozen_routing_queries(model))
+
+
 def test_fsdp2_flag_refuses_unsupported_combinations():
     import argparse
 

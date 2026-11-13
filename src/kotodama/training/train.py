@@ -194,6 +194,22 @@ def check_rank_batches_distinct(ids: torch.Tensor, group: Any, device: torch.dev
     return digests
 
 
+FROZEN_ROUTING_CHECK_STEP = 50
+
+
+def frozen_routing_queries(model: torch.nn.Module) -> list[str]:
+    """Trainable AttnRes routing queries still exactly zero (their init): the BUG-LEDGER B1 signature, where fp8 +
+    DDP + torch.compile gave the pre-MLP queries bit-exact zero gradients. After a few optimizer steps a query
+    that trains has moved off zero. Reads full values (collective on a sharded model)."""
+    names: list[str] = []
+    for name, p in model.named_parameters():
+        if name.endswith("res_query") and p.requires_grad:
+            full = p.full_tensor() if is_dtensor(p) else p
+            if torch.count_nonzero(full.detach()) == 0:
+                names.append(name)
+    return names
+
+
 def hm_config(config: dict[str, Any]) -> None:
     """Record run hyperparameters with Scheduler (runs-table columns, group-by, scatter
     axes). Scalars and strings only; merged server-side. No-op outside Scheduler."""
@@ -1502,6 +1518,14 @@ def train(args: argparse.Namespace) -> None:
         # scheduler afterwards ran step 0 at the full base LR (an unwarmed step
         # on random init) and every later step one multiplier behind.
         scheduler.step(step)
+
+        # fp8 under DDP has frozen the AttnRes routing before (BUG-LEDGER B1, mechanism unexplained): fail fast.
+        if (step == FROZEN_ROUTING_CHECK_STEP and not use_fsdp2 and getattr(args, "fp8", False)
+                and config.attn_res):
+            _frozen = frozen_routing_queries(raw_model)
+            if _frozen:
+                raise RuntimeError(f"{len(_frozen)} AttnRes routing queries are still exactly zero at step {step} "
+                                   f"under DDP + fp8 (BUG-LEDGER B1), e.g. {_frozen[:3]}; use --fsdp2 or drop --fp8")
 
         # Optimizer step (--time_optimizer_step: wall time of the two steps on log steps, between device syncs)
         _time_opt = getattr(args, "time_optimizer_step", False) and (
