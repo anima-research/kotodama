@@ -18,7 +18,8 @@
 # Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS] [extra train flags...]
 #   RUNS: comma list of run names (default: ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,
 #         fsdp2-layer-mxfp8; also fsdp2-zero2, fsdp2-defer, fsdp2-mb16, fsdp2-layer-flat, fsdp2-group2,
-#         fsdp2-group4: two or four consecutive layers per shard group)
+#         fsdp2-group4: two or four consecutive layers per shard group; fsdp2-layer-mxfp8-levers: fsdp2-layer-mxfp8
+#         with the AttnRes stack-grad chain and the tuned RMSNorm launches)
 #   Extra train flags come last on every run's command line, so they override the recipe and the run's own flags
 #   (another shape: --model_size NAME --attn_res_n_blocks N --micro_batch_size 1 --global_batch_tokens T).
 set -uo pipefail
@@ -51,6 +52,8 @@ for name in "${LIST[@]}"; do
     fsdp2-layer-zero2) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --no_fsdp2_reshard_after_forward --micro_batch_size 8) ;;
     fsdp2-layer-mb16) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 16) ;;
     fsdp2-layer-mxfp8) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
+    fsdp2-layer-mxfp8-levers) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8
+                                     --attnres_stack_grad_chain --liger_rmsnorm_tuned) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
     fsdp2-layer-flat) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8) ;;
     fsdp2-group2) EXTRA=(--fsdp2 --fsdp2_layers_per_group 2 --micro_batch_size 8) ;;

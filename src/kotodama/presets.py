@@ -57,6 +57,11 @@ SHAPES: dict[str, dict[str, Any]] = {
     "10b-bench-loop": dict(hidden_size=3584, num_layers=80, num_attention_heads=28,
                            num_kv_heads=14, head_dim=128, intermediate_size=9472,
                            loop_start=24, loop_len=16, loop_times=2, **_COMMON),
+    # A ~10.5B deep-narrow benchmark shape at tsumugi's width ratio (not a trained model): d3072, 140 effective layers
+    # from 100 unique ones = 30 prelude + a 40-layer core run 2x + 30 coda; heads 24 / kv 12, FFN 8192.
+    "10b-bench-spire": dict(hidden_size=3072, num_layers=140, num_attention_heads=24,
+                            num_kv_heads=12, head_dim=128, intermediate_size=8192,
+                            loop_start=30, loop_len=40, loop_times=2, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — between the proxy and the 1b.
     "intermediate": dict(hidden_size=1024, num_layers=28, num_attention_heads=8,
                          num_kv_heads=4, head_dim=128, intermediate_size=2816, **_COMMON),
