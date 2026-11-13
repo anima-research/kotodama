@@ -97,6 +97,9 @@ def mix_window_seqs(spec: str | None, tokens_per_seq_step: int) -> tuple[int, in
 # ── Scheduler metrics (lightweight, no dependency) ────────────────────────────
 
 _hm_job_id = os.environ.get("KOTODAMA_SCHEDULER_JOB_ID")
+# Several trainings in one scheduler job (gate scripts run arms back to back): a per-run label prefixed to every key
+# gives each run its own series instead of every run's step 0..N drawn over one another.
+_hm_prefix = os.environ.get("KOTODAMA_SCHEDULER_METRIC_PREFIX", "").strip("/")
 # Metrics post from a background thread: a synchronous POST on rank 0 stalled every rank at the next all-reduce for as
 # long as the coordinator took to answer. Bounded queue; when full, new points are dropped (telemetry never stalls
 # training). One worker, so points arrive in order. Flushed (bounded wait) at exit.
@@ -137,7 +140,7 @@ def hm_log(step: int, **metrics: float) -> None:
     global _hm_queue
     if not _hm_job_id:
         return
-    clean = {k: v for k, v in metrics.items() if v is not None}
+    clean = {(f"{_hm_prefix}/{k}" if _hm_prefix else k): v for k, v in metrics.items() if v is not None}
     if not clean:
         return
     if _hm_queue is None:

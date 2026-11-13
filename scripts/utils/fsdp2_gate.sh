@@ -27,6 +27,8 @@ SCHEDULE="$T:$T,$(( (Q - 1) * T )):$(( Q * T )),$(( (STEPS - Q) * T )):$(( STEPS
 mkdir -p "$OUT"
 export KOTODAMA_NPROC="$WORLD"
 export KOTODAMA_DEBUG_BATCH_HASH="${KOTODAMA_DEBUG_BATCH_HASH:-20}"
+# One telemetry series per arm when several arms share a scheduler job.
+export KOTODAMA_SCHEDULER_METRIC_PREFIX="${KOTODAMA_SCHEDULER_METRIC_PREFIX-$(basename "$OUT")}"
 echo "fsdp2-gate arm=$ARM world=$WORLD steps=$STEPS micro_batch=$MB schedule=$SCHEDULE"
 "$ROOT/tools/run_train.sh" --config "$ROOT/configs/tsumugi-1b.yaml" "${EXTRA[@]}" \
   --no_compile --no_geo_monitor --inloop_evals '' --mix_fraction 0 --no_attnres_eps_fp64_compat \

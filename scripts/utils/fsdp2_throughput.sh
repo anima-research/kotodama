@@ -57,7 +57,7 @@ for name in "${LIST[@]}"; do
   nvidia-smi --query-gpu=timestamp,index,power.draw,clocks.sm,clocks_throttle_reasons.active \
     --format=csv,noheader,nounits -l 5 > "$OUT/$name/power.csv" 2>/dev/null &
   SAMPLER=$!
-  KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
+  KOTODAMA_SCHEDULER_METRIC_PREFIX="$name" KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
     --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train${LOGSUFFIX}.log"
   echo "=== $name exit ${PIPESTATUS[0]} $(date -u +%H:%M:%S) ==="
   kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null

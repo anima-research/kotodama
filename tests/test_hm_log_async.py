@@ -61,3 +61,15 @@ def test_noop_without_job(monkeypatch):
     monkeypatch.setattr(train, "_hm_queue", None)
     train.hm_log(0, loss=1.0)
     assert train._hm_queue is None
+
+
+def test_metric_prefix_gives_each_run_its_own_series(monkeypatch):
+    q: queue.Queue = queue.Queue()
+    monkeypatch.setattr(train, "_hm_job_id", "job")
+    monkeypatch.setattr(train, "_hm_queue", q)
+    monkeypatch.setattr(train, "_hm_prefix", "fsdp2-resume")
+    train.hm_log(7, **{"train/loss": 2.5, "skipped": None})
+    assert q.get_nowait() == (7, {"fsdp2-resume/train/loss": 2.5})
+    monkeypatch.setattr(train, "_hm_prefix", "")
+    train.hm_log(8, **{"train/loss": 2.4})
+    assert q.get_nowait() == (8, {"train/loss": 2.4})
