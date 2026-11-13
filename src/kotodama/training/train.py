@@ -729,9 +729,15 @@ def train(args: argparse.Namespace) -> None:
                              reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
                                            else torch.float32))
         if is_main:
-            logger.info("FSDP2: %d units (unique attn/ffn) + root, mesh %s, reshard_after_forward=%s; "
+            from kotodama.training.fsdp import fsdp_layer_groups
+
+            _n_groups = (len(fsdp_layer_groups(model)) if getattr(args, "fsdp2_group_layers", False)
+                         else len(_units))
+            logger.info("FSDP2: %d shard groups (%s) + root, mesh %s, reshard_after_forward=%s; "
                         "fp32 sharded params, bf16 compute, %s grad reduction",
-                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True),
+                        _n_groups, "one per unique layer" if getattr(args, "fsdp2_group_layers", False)
+                        else "one per unique attn/ffn", fsdp_mesh,
+                        getattr(args, "fsdp2_reshard_after_forward", True),
                         getattr(args, "fsdp2_reduce_dtype", "fp32"))
 
     # torch.compile for throughput (compile before DDP)
