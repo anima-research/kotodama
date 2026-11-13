@@ -2217,8 +2217,6 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
         "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
         "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
-        "--attnres_query_norm (its routing temperatures are 0-dim parameters, which fully_shard cannot shard)":
-            getattr(args, "attnres_query_norm", False),
     }
     bad = [name for name, on in unsupported.items() if on]
     if bad:

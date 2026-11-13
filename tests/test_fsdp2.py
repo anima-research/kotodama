@@ -43,7 +43,7 @@ BATCH, SEQ = 2, 24
 
 def _cfg(query_norm: bool = False) -> KotodamaModelConfig:
     # q 128 / kv 64 / ffn 320 / vocab 256 rows: none divides by 3. query_norm: unit-norm routing queries (a direction
-    # and a 0-dim temperature per site), which need a folded gain.
+    # and a one-element temperature per site), which need a folded gain.
     extra = dict(attn_res_query_norm=True, attn_res_gain="folded") if query_norm else {}
     return KotodamaModelConfig(hidden_size=128, num_layers=6, num_attention_heads=2, num_kv_heads=1, head_dim=64,
                                intermediate_size=320, vocab_size=256, max_position_embeddings=64, attn_res=True,
@@ -56,8 +56,10 @@ def _reference(query_norm: bool = False) -> KotodamaModel:
     model = KotodamaModel(_cfg(query_norm))
     with torch.no_grad():  # non-trivial routing (fresh queries, or fresh temperatures, are zero)
         for name, p in model.named_parameters():
-            if (name.endswith("res_query") or name.endswith("res_query.0.temperature")) and p.requires_grad:
-                p.normal_(0.0 if p.ndim else 1.0, 0.05 if p.ndim else 0.2)
+            if name.endswith("res_query.0.temperature"):
+                p.normal_(1.0, 0.2)
+            elif name.endswith("res_query") and p.requires_grad:
+                p.normal_(0.0, 0.05)
     return model
 
 
@@ -234,11 +236,7 @@ def _parity_worker(rank: int, world: int, init_file: str, query_norm: bool = Fal
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("query_norm", [
-    False,
-    pytest.param(True, marks=pytest.mark.xfail(strict=True, reason="fully_shard cannot shard the 0-dim routing "
-                                               "temperatures; --fsdp2 refuses --attnres_query_norm until they are 1-D")),
-], ids=["plain-queries", "unit-norm-queries"])
+@pytest.mark.parametrize("query_norm", [False, True], ids=["plain-queries", "unit-norm-queries"])
 def test_fsdp2_matches_unsharded_model(query_norm, tmp_path):
     _spawn(_parity_worker, 3, tmp_path, query_norm)
 
@@ -565,8 +563,7 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
     validate_fsdp2_args(ok)
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "inloop_evals": "riders,induction"}))
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "fp8": True, "fp8_recipe": "mxfp8"}))
-    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True),
-                dict(attnres_query_norm=True)):
+    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True)):
         with pytest.raises(ValueError, match="does not support"):
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):

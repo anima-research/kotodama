@@ -133,7 +133,7 @@ class UnitRoutingQuery(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.temperature = nn.Parameter(torch.zeros(()))
+        self.temperature = nn.Parameter(torch.zeros(1))  # 1-D: FSDP2 cannot shard a 0-dim parameter
 
     def forward(self, q: torch.Tensor) -> torch.Tensor:
         norm = q.float().norm().clamp_min(1e-12)
