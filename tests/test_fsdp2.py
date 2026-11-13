@@ -479,10 +479,12 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
 
     from kotodama.training.train import validate_fsdp2_args
 
-    ok = argparse.Namespace(fsdp2=True, fsdp2_replicas=2, tp_size=1, fp8=False, geo_monitor=False, inloop_evals="")
+    ok = argparse.Namespace(fsdp2=True, fsdp2_replicas=2, tp_size=1, fp8=False, fp8_recipe="tensorwise",
+                            geo_monitor=False, inloop_evals="")
     validate_fsdp2_args(ok)
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "inloop_evals": "riders,induction"}))
-    for bad in (dict(tp_size=2), dict(fp8=True), dict(geo_monitor=True)):
+    validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "fp8": True, "fp8_recipe": "mxfp8"}))
+    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True)):
         with pytest.raises(ValueError, match="does not support"):
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):

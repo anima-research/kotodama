@@ -685,23 +685,6 @@ def train(args: argparse.Namespace) -> None:
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
 
-    # FSDP2: shard after every weight is loaded (and every requires_grad final), before compile.
-    if use_fsdp2:
-        from kotodama.training.fsdp import apply_fsdp2, build_mesh, params_to_fp32
-
-        params_to_fp32(model)
-        fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
-        _units = apply_fsdp2(model, fsdp_mesh,
-                             reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True),
-                             group_layers=getattr(args, "fsdp2_group_layers", False),
-                             reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
-                                           else torch.float32))
-        if is_main:
-            logger.info("FSDP2: %d units (unique attn/ffn) + root, mesh %s, reshard_after_forward=%s; "
-                        "fp32 sharded params, bf16 compute, %s grad reduction",
-                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True),
-                        getattr(args, "fsdp2_reduce_dtype", "fp32"))
-
     # Tensor parallelism: shard projection weights across TP group
     if tp_group is not None:
         from kotodama.training.tensor_parallel import apply_tensor_parallelism
@@ -732,6 +715,24 @@ def train(args: argparse.Namespace) -> None:
                 raise ImportError(
                     "--fp8 requires torchao. Install with: uv pip install torchao"
                 )
+
+    # FSDP2: shard after every weight is loaded (and every requires_grad final) and after the fp8 module swap
+    # (MXFP8Linear keeps nn.Parameter weights, so the swapped modules shard like any linear), before compile.
+    if use_fsdp2:
+        from kotodama.training.fsdp import apply_fsdp2, build_mesh, params_to_fp32
+
+        params_to_fp32(model)
+        fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
+        _units = apply_fsdp2(model, fsdp_mesh,
+                             reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True),
+                             group_layers=getattr(args, "fsdp2_group_layers", False),
+                             reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
+                                           else torch.float32))
+        if is_main:
+            logger.info("FSDP2: %d units (unique attn/ffn) + root, mesh %s, reshard_after_forward=%s; "
+                        "fp32 sharded params, bf16 compute, %s grad reduction",
+                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True),
+                        getattr(args, "fsdp2_reduce_dtype", "fp32"))
 
     # torch.compile for throughput (compile before DDP)
     if args.compile:
@@ -1970,7 +1971,8 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
     - ``router/layer_{i}/{attn,mlp}/{query_norm,grad_norm}`` and ``router/final/…``:
       the AttnRes routing queries. ``grad_norm == 0`` exactly is the dead-router signature;
       ``router/dead_sites`` counts them (queries with no ``.grad`` — frozen or
-      structurally unused, like layer 0's pre-attn — are not sites).
+      structurally unused, like layer 0's pre-attn — are not sites); ``router/dead_sites/{attn,mlp,final}``
+      split them by site kind (a frozen pre-MLP routing, e.g., shows as ``…/mlp`` alone).
     """
     # (key, how, tensor index); how: "norm" = sqrt(sum sq), "rms" = sqrt(mean sq), "sq" = summed into a grad key.
     reads: list[tuple[str, str, int]] = []
@@ -2013,6 +2015,10 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
         out[key] = math.sqrt(ss)
     if router_grad_keys:
         out["router/dead_sites"] = float(sum(out[k] == 0.0 for k in router_grad_keys))
+        for kind in ("attn", "mlp", "final"):  # pre-attn / pre-MLP / final readout
+            keys = [k for k in router_grad_keys
+                    if (k == "router/final/grad_norm" if kind == "final" else k.endswith(f"/{kind}/grad_norm"))]
+            out[f"router/dead_sites/{kind}"] = float(sum(out[k] == 0.0 for k in keys))
     return out
 
 
@@ -2138,7 +2144,8 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         return
     unsupported = {
         "--tp_size > 1": getattr(args, "tp_size", 1) > 1,
-        "--fp8": getattr(args, "fp8", False),
+        "--fp8 other than --fp8_recipe mxfp8": getattr(args, "fp8", False) and getattr(
+            args, "fp8_recipe", "tensorwise") != "mxfp8",
         "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
         "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
         "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
