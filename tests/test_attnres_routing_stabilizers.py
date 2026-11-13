@@ -47,6 +47,10 @@ def test_unit_norm_init_matches_zero_query_model():
         assert torch.equal(plain.eval()(_ids())["logits"], unit.eval()(_ids())["logits"])
 
 
+def test_temperatures_are_one_element_vectors():
+    assert all(t.shape == (1,) for t in _temperatures(_model(True)))  # FSDP2's fully_shard refuses 0-dim params
+
+
 def test_effective_query_is_temperature_times_unit_direction():
     m = _model(True)
     with torch.no_grad():
