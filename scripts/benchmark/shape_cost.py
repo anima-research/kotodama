@@ -4,6 +4,10 @@ Builds KotodamaModel directly with the training stack's settings (FA4 varlen inp
 QK-norm, fp32 RoPE, whole-model torch.compile, bf16 weights), feeds random tokens, and times fwd+bwd of one
 micro-batch (no optimizer step; that cost is O(params) and modelled separately). One JSON line per run on stdout.
 
+--profile adds where the step's wall time goes: GPU-busy time (the union of kernel intervals in one traced step) vs
+idle (launch gaps, host syncs), the kernel count, busy time by kernel family (GEMM, attention, other), and the GPU's
+power draw and SM clock sampled over the timed steps (a power-capped GPU lowers its clock).
+
 Pairs of runs price AttnRes routing: the same shape with --n_blocks N and with --n_blocks 0 (no AttnRes) differ by
 exactly the routing work, whose per-layer share depends on N and the width, not on the depth.
 
@@ -13,10 +17,16 @@ exactly the routing work, whose per-layer share depends on N and the width, not 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
+import statistics
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 import torch
 
@@ -26,6 +36,91 @@ from kotodama.model import llama  # noqa: E402
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig  # noqa: E402
 
 DEVICE = "cuda"
+GEMM_MARKERS = ("gemm", "cutlass", "nvjet", "xmma", "matmul", "_mm_", "sm90_", "sm100_")
+ATTN_MARKERS = ("flash", "fmha", "attention")
+
+
+def _family(name: str) -> str:
+    low = name.lower()
+    if any(m in low for m in ATTN_MARKERS):
+        return "attention"
+    if any(m in low for m in GEMM_MARKERS):
+        return "gemm"
+    return "other"
+
+
+def _union_ms(intervals: list[tuple[float, float]]) -> float:
+    """Total length (ms) of the union of [start, end) intervals given in microseconds."""
+    total, cur_s, cur_e = 0.0, None, None
+    for s_, e_ in sorted(intervals):
+        if cur_e is None or s_ > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = s_, e_
+        else:
+            cur_e = max(cur_e, e_)
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total / 1e3
+
+
+def trace_step(step: Callable[[], None]) -> dict[str, float]:
+    """One step under the torch profiler: wall (first kernel start to last kernel end), GPU-busy union, kernel count
+    and busy ms per kernel family."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        step()
+        torch.cuda.synchronize()
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "trace.json")
+        prof.export_chrome_trace(path)
+        events = json.load(open(path)).get("traceEvents", [])
+    kernels = [e for e in events if e.get("cat") == "kernel" and "dur" in e]
+    if not kernels:
+        return {"trace_error": 1.0}
+    spans = [(float(e["ts"]), float(e["ts"]) + float(e["dur"])) for e in kernels]
+    wall = (max(e for _s, e in spans) - min(s_ for s_, _e in spans)) / 1e3
+    busy = _union_ms(spans)
+    out = {"trace_wall_ms": wall, "gpu_busy_ms": busy, "gpu_idle_frac": 1.0 - busy / wall, "kernels": float(len(kernels))}
+    for fam in ("gemm", "attention", "other"):
+        out[f"busy_{fam}_ms"] = _union_ms([sp for sp, e in zip(spans, kernels) if _family(e.get("name", "")) == fam])
+    return out
+
+
+class PowerSampler:
+    """Samples power (W) and SM clock (MHz) of the current GPU every ``period`` s on a thread, via torch.cuda (NVML).
+    Silent no-op where NVML is unavailable."""
+
+    def __init__(self, period: float = 0.05) -> None:
+        self.period, self.watts, self.mhz = period, [], []
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.watts.append(torch.cuda.power_draw() / 1e3)
+                self.mhz.append(float(torch.cuda.clock_rate()))
+            except Exception:  # noqa: BLE001 — no NVML: report nothing rather than fail the timing run
+                return
+            time.sleep(self.period)
+
+    def __enter__(self) -> "PowerSampler":
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._t is not None:
+            self._t.join()
+
+    def summary(self) -> dict[str, float]:
+        if not self.watts:
+            return {}
+        return {"power_w_median": statistics.median(self.watts), "power_w_max": max(self.watts),
+                "sm_mhz_median": statistics.median(self.mhz), "sm_mhz_min": min(self.mhz)}
 
 
 def main() -> int:
@@ -51,6 +146,8 @@ def main() -> int:
                          "the compiled model returns logits and the CE runs eagerly — under a single unsplit compiled "
                          "graph (no DDP) inductor mis-reconstructs FLCE's chunked in-place writes (an as_strided read "
                          "past a 128-element slice -> illegal address at B*T 4096).")
+    ap.add_argument("--profile", action="store_true",
+                    help="also trace one step (GPU busy vs idle, kernel families) and sample power + SM clock")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
 
@@ -91,22 +188,28 @@ def main() -> int:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     times = []
-    for _ in range(a.iters):
-        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        s.record()
-        step()
-        e.record()
-        torch.cuda.synchronize()
-        times.append(s.elapsed_time(e))
+    sampler = PowerSampler()
+    with (sampler if a.profile else contextlib.nullcontext()):
+        for _ in range(a.iters):
+            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s.record()
+            step()
+            e.record()
+            torch.cuda.synchronize()
+            times.append(s.elapsed_time(e))
     times.sort()
     ms = times[len(times) // 2]
+    extra: dict[str, float] = {}
+    if a.profile:
+        extra.update(sampler.summary())
+        extra.update(trace_step(step))
     print(json.dumps({
         "tag": a.tag, "hidden": a.hidden, "heads": a.heads, "kv": a.kv, "ffn": a.ffn, "eff_layers": cfg.num_layers,
         "unique_layers": cfg.num_unique_layers, "n_blocks": a.n_blocks,
         "loop": [a.loop_start, a.loop_len, a.loop_times],
         "chain": a.chain, "flce": a.flce, "mb": B, "seq": T, "params": sum(p.numel() for p in model.parameters()),
         "fwd_bwd_ms": ms, "us_per_token": ms * 1e3 / (B * T), "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
-        "compile_s": compile_s,
+        "compile_s": compile_s, **extra,
     }), flush=True)
     return 0
 
