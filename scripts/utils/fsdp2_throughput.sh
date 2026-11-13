@@ -4,8 +4,10 @@
 # readers off in every arm: ddp (micro-batch 8), fsdp2 (8), fsdp2 without reshard-after-forward (8), fsdp2 with
 # the gradient reduce-scatter deferred to each step's last micro-step (8), fsdp2 with one unit per layer (8),
 # fsdp2 (16).
-# Each run's log is OUT/<name>/train.log; the summary (mean tok/s, MFU, optimizer share and peak memory over the
-# second half of the steps) is printed at the end and written to OUT/summary.md.
+# Each run's log is OUT/<name>/train.log and its GPU power / SM clock / throttle reasons, sampled every 5 s, are
+# OUT/<name>/power.csv; the summary (over the second half of the steps: mean tok/s, MFU, optimizer share, peak
+# memory, mean power and clock, and the share of samples throttled by the software power cap, bit 0x4) is printed at
+# the end and written to OUT/summary.md.
 #
 # Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS]
 #   RUNS: comma list from ddp,fsdp2,fsdp2-zero2,fsdp2-defer,fsdp2-layer,fsdp2-mb16 (default: all six)
@@ -31,9 +33,13 @@ for name in "${LIST[@]}"; do
   esac
   mkdir -p "$OUT/$name"
   echo "=== $name $(date -u +%H:%M:%S) ==="
+  nvidia-smi --query-gpu=timestamp,index,power.draw,clocks.sm,clocks_throttle_reasons.active \
+    --format=csv,noheader,nounits -l 5 > "$OUT/$name/power.csv" 2>/dev/null &
+  SAMPLER=$!
   "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
     --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train.log"
   echo "=== $name exit ${PIPESTATUS[0]} $(date -u +%H:%M:%S) ==="
+  kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
 done
 source "$ROOT/tools/_env.sh"
 python - "$OUT" "$STEPS" "${LIST[@]}" <<'EOF'
@@ -42,7 +48,22 @@ from pathlib import Path
 out, steps, names = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
 step_re = re.compile(r"step=(\d+)/\d+ .*?tok/s=(\d+) .*?mfu=([0-9.]+)% .*?gpu_mem=([0-9.]+)GB")
 opt_re = re.compile(r"opt_step=([0-9.]+)s \(([0-9.]+)% of the mean step ([0-9.]+)s\)")
-lines = ["| run | tok/s | MFU % | step s | opt step s | opt % of step | peak GB | status |", "|---|---|---|---|---|---|---|---|"]
+def power(path):
+    """(mean W per GPU, mean SM MHz, share of samples with the SW power cap bit 0x4) over the file's second half."""
+    rows = []
+    for line in (path.read_text(errors="replace").splitlines() if path.exists() else []):
+        f = [x.strip() for x in line.split(",")]
+        try:
+            rows.append((float(f[2]), float(f[3]), int(f[4], 16)))
+        except (IndexError, ValueError):
+            continue
+    rows = rows[len(rows) // 2:]
+    if not rows:
+        return "", "", ""
+    return (f"{statistics.mean(r[0] for r in rows):.0f}", f"{statistics.mean(r[1] for r in rows):.0f}",
+            f"{100 * sum(bool(r[2] & 0x4) for r in rows) / len(rows):.0f}%")
+lines = ["| run | tok/s | MFU % | step s | opt step s | opt % of step | peak GB | W/GPU | SM MHz | power-capped | status |",
+         "|---|---|---|---|---|---|---|---|---|---|---|"]
 for n in names:
     log = out / n / "train.log"
     text = log.read_text(errors="replace") if log.exists() else ""
@@ -50,13 +71,14 @@ for n in names:
     opts = [(float(a), float(b), float(c)) for a, b, c in opt_re.findall(text)]
     late = [r for r in rows if r[0] >= steps // 2]
     late_opt = opts[-max(1, len(opts) // 2):] if opts else []
+    pw, mhz, capped = power(out / n / "power.csv")
     if not late:
-        lines.append(f"| {n} | | | | | | | no steps (see {log}) |")
+        lines.append(f"| {n} | | | | | | | {pw} | {mhz} | {capped} | no steps (see {log}) |")
         continue
     lines.append(f"| {n} | {statistics.mean(r[1] for r in late):.0f} | {statistics.mean(r[2] for r in late):.1f} | "
                  f"{statistics.mean(o[2] for o in late_opt):.3f} | {statistics.mean(o[0] for o in late_opt):.4f} | "
                  f"{statistics.mean(o[1] for o in late_opt):.2f} | {max(r[3] for r in rows):.1f} | "
-                 f"{'complete' if 'Training complete' in text else 'incomplete'} |")
+                 f"{pw} | {mhz} | {capped} | {'complete' if 'Training complete' in text else 'incomplete'} |")
 (out / "summary.md").write_text("\n".join(lines) + "\n")
 print("\n".join(lines))
 EOF
