@@ -7,6 +7,7 @@
 #   ARM  ddp      the reference: DDP, micro-batch 2
 #        ddp-mb1  the reference's own noise: DDP, micro-batch 1 (same data per rank, twice the accumulation)
 #        fsdp2    the arm under test: --fsdp2, micro-batch 2
+#        fsdp2-bf16rs  --fsdp2 with gradients reduced in bf16 (DDP's reduction precision), micro-batch 2
 set -euo pipefail
 ARM="$1"; WORLD="$2"; OUT="$3"; DATA="$4"; STEPS="${5:-200}"; shift 5 || shift $#
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,7 +15,8 @@ case "$ARM" in
   ddp) MB=2; EXTRA=() ;;
   ddp-mb1) MB=1; EXTRA=() ;;
   fsdp2) MB=2; EXTRA=(--fsdp2) ;;
-  *) echo "unknown arm $ARM (ddp | ddp-mb1 | fsdp2)" >&2; exit 2 ;;
+  fsdp2-bf16rs) MB=2; EXTRA=(--fsdp2 --fsdp2_reduce_dtype bf16) ;;
+  *) echo "unknown arm $ARM (ddp | ddp-mb1 | fsdp2 | fsdp2-bf16rs)" >&2; exit 2 ;;
 esac
 SEQ=4096; SEQS=24; T=$((SEQ * SEQS)); Q=$((STEPS / 4))
 [ "$Q" -ge 2 ] || { echo "STEPS must be >= 8" >&2; exit 2; }

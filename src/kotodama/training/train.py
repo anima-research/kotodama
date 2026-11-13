@@ -692,11 +692,14 @@ def train(args: argparse.Namespace) -> None:
         params_to_fp32(model)
         fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
         _units = apply_fsdp2(model, fsdp_mesh,
-                             reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True))
+                             reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True),
+                             reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
+                                           else torch.float32))
         if is_main:
             logger.info("FSDP2: %d units (unique attn/ffn) + root, mesh %s, reshard_after_forward=%s; "
-                        "fp32 sharded params, bf16 compute, fp32 grad reduction",
-                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True))
+                        "fp32 sharded params, bf16 compute, %s grad reduction",
+                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True),
+                        getattr(args, "fsdp2_reduce_dtype", "fp32"))
 
     # Tensor parallelism: shard projection weights across TP group
     if tp_group is not None:
@@ -2636,6 +2639,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_fsdp2_reshard_after_forward", dest="fsdp2_reshard_after_forward", action="store_false",
         help="Turn off --fsdp2_reshard_after_forward.",
+    )
+    p.add_argument(
+        "--fsdp2_reduce_dtype", choices=("fp32", "bf16"), default="fp32",
+        help="With --fsdp2: the dtype gradients are reduce-scattered (and their shards accumulated) in. fp32 "
+             "(default) is exact to the fp32 sum; bf16 halves the gradient traffic and rounds like DDP's bf16 "
+             "all-reduce.",
     )
     p.add_argument(
         "--fsdp2_defer_grad_sync", action="store_true",
