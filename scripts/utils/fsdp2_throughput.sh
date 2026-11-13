@@ -34,10 +34,10 @@ for name in "${LIST[@]}"; do
     fsdp2) EXTRA=(--fsdp2 --micro_batch_size 8) ;;
     fsdp2-zero2) EXTRA=(--fsdp2 --no_fsdp2_reshard_after_forward --micro_batch_size 8) ;;
     fsdp2-defer) EXTRA=(--fsdp2 --fsdp2_defer_grad_sync --micro_batch_size 8) ;;
-    fsdp2-layer) EXTRA=(--fsdp2 --fsdp2_group_layers --micro_batch_size 8) ;;
-    fsdp2-layer-zero2) EXTRA=(--fsdp2 --fsdp2_group_layers --no_fsdp2_reshard_after_forward --micro_batch_size 8) ;;
-    fsdp2-layer-mb16) EXTRA=(--fsdp2 --fsdp2_group_layers --micro_batch_size 16) ;;
-    fsdp2-layer-mxfp8) EXTRA=(--fsdp2 --fsdp2_group_layers --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
+    fsdp2-layer) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8) ;;
+    fsdp2-layer-zero2) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --no_fsdp2_reshard_after_forward --micro_batch_size 8) ;;
+    fsdp2-layer-mb16) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 16) ;;
+    fsdp2-layer-mxfp8) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
     *) echo "unknown run $name" >&2; exit 2 ;;
   esac

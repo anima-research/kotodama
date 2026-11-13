@@ -125,19 +125,38 @@ def fsdp_units(model: nn.Module) -> list[nn.Module]:
     return units
 
 
-def fsdp_layer_groups(model: nn.Module) -> list[list[nn.Module]]:
-    """The units grouped per unique layer: ``[attn, ffn]`` of every layer whose modules are not loop repeats, in
-    layer order. One ``fully_shard`` call per group gathers and reshards the layer's attention and FFN weights
-    together (half the hook calls and collectives of one unit per module)."""
+def fsdp_layer_groups(model: nn.Module, layers_per_group: int = 1) -> list[list[nn.Module]]:
+    """Shard groups of ``layers_per_group`` consecutive unique layers: each group is the ``[attn, ffn, ...]`` of
+    those layers, gathered and resharded together (fewer hook calls and collectives than one unit per module; the
+    lever for deep, narrow shapes, whose fixed per-group cost scales with depth while the work per gather scales
+    with width). Groups never mix the looped core with the layers outside it, so a loop pass gathers only core
+    weights. Loop repeats contribute nothing new."""
+    if layers_per_group < 1:
+        raise ValueError(f"layers_per_group must be >= 1, got {layers_per_group}")
+    cfg = getattr(model, "config", None)
+    looped = ({cfg.layer_source(i) for i in range(cfg.num_layers) if cfg.layer_source(i) != i}
+              if cfg is not None else set())
     groups: list[list[nn.Module]] = []
     seen: set[int] = set()
+    current: list[nn.Module] = []
+    current_layers = 0
+    current_core: Optional[bool] = None
     for i, layer in enumerate(model.layers):  # type: ignore[attr-defined]
         a, f = id(layer.attn), id(layer.ffn)
         if (a in seen) != (f in seen):
             raise ValueError(f"layer {i}: attn and ffn are not shared together; cannot group them")
-        if a not in seen:
-            seen.update((a, f))
-            groups.append([layer.attn, layer.ffn])
+        if a in seen:
+            continue
+        seen.update((a, f))
+        core = i in looped
+        if current and (current_layers == layers_per_group or core != current_core):
+            groups.append(current)
+            current, current_layers = [], 0
+        current += [layer.attn, layer.ffn]
+        current_layers += 1
+        current_core = core
+    if current:
+        groups.append(current)
     return groups
 
 
@@ -173,14 +192,14 @@ def apply_fsdp2(
     param_dtype: Optional[torch.dtype] = torch.bfloat16,
     reduce_dtype: torch.dtype = torch.float32,
     reshard_after_forward: bool = True,
-    group_layers: bool = False,
+    layers_per_group: int = 0,
 ) -> list[nn.Module]:
     """Shard ``model`` in place per the module docstring's plan; returns the non-root units.
 
     Call after every weight is loaded and every parameter's ``requires_grad`` is final, and after
     :func:`params_to_fp32`. ``param_dtype=None`` computes in the parameters' own dtype (tests compare against an
-    fp32 reference that way). ``group_layers`` shards each unique layer's attention and FFN as one group
-    (:func:`fsdp_layer_groups`) instead of one unit per module."""
+    fp32 reference that way). ``layers_per_group`` >= 1 shards that many consecutive unique layers as one group
+    (:func:`fsdp_layer_groups`); 0 = one unit per attn / ffn module."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     for name, p in model.named_parameters():
@@ -189,7 +208,7 @@ def apply_fsdp2(
                              "the fp32 masters)")
     mp = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=False)
     units = fsdp_units(model)
-    shard_calls: list[Any] = fsdp_layer_groups(model) if group_layers else units
+    shard_calls: list[Any] = fsdp_layer_groups(model, layers_per_group) if layers_per_group > 0 else units
     for unit in shard_calls:
         fully_shard(unit, mesh=mesh, mp_policy=mp, reshard_after_forward=reshard_after_forward)
     fully_shard(model, mesh=mesh, mp_policy=mp, reshard_after_forward=reshard_after_forward)

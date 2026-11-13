@@ -273,10 +273,15 @@ def _grouped_worker(rank: int, world: int, init_file: str) -> None:
 
     _init(rank, world, init_file)
     ref = _reference()
-    assert len(fsdp_layer_groups(ref)) == ref.config.num_unique_layers
+    assert len(fsdp_layer_groups(ref, 1)) == ref.config.num_unique_layers
+    # layers 0..3 unique, core = {1, 2} (looped at 3, 4); groups of 2 never straddle the core boundary
+    layer_of: dict[int, int] = {}
+    for i, lyr in enumerate(ref.layers):  # first occurrence: loop repeats map to their core layer
+        layer_of.setdefault(id(lyr.attn), i)
+    assert [[layer_of[id(m)] for m in g[::2]] for g in fsdp_layer_groups(ref, 2)] == [[0], [1, 2], [5]]
     model = copy.deepcopy(ref)
     params_to_fp32(model)
-    apply_fsdp2(model, init_device_mesh("cpu", (world,)), param_dtype=None, group_layers=True)
+    apply_fsdp2(model, init_device_mesh("cpu", (world,)), param_dtype=None, layers_per_group=2)
     _mean_loss(ref, 0, range(world)).backward()
     model(_batch(0, rank), labels=_batch(0, rank))["loss"].backward()
     ref_params = dict(ref.named_parameters())

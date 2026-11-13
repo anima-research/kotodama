@@ -741,18 +741,18 @@ def train(args: argparse.Namespace) -> None:
         fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
         _units = apply_fsdp2(model, fsdp_mesh,
                              reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True),
-                             group_layers=getattr(args, "fsdp2_group_layers", False),
+                             layers_per_group=getattr(args, "fsdp2_layers_per_group", 0),
                              reduce_dtype=(torch.bfloat16 if getattr(args, "fsdp2_reduce_dtype", "fp32") == "bf16"
                                            else torch.float32))
         if is_main:
             from kotodama.training.fsdp import fsdp_layer_groups
 
-            _n_groups = (len(fsdp_layer_groups(model)) if getattr(args, "fsdp2_group_layers", False)
-                         else len(_units))
+            _lpg = getattr(args, "fsdp2_layers_per_group", 0)
+            _n_groups = len(fsdp_layer_groups(model, _lpg)) if _lpg > 0 else len(_units)
             logger.info("FSDP2: %d shard groups (%s) + root, mesh %s, reshard_after_forward=%s; "
                         "fp32 sharded params, bf16 compute, %s grad reduction",
-                        _n_groups, "one per unique layer" if getattr(args, "fsdp2_group_layers", False)
-                        else "one per unique attn/ffn", fsdp_mesh,
+                        _n_groups, f"{_lpg} unique layer(s) each" if _lpg > 0 else "one per unique attn/ffn",
+                        fsdp_mesh,
                         getattr(args, "fsdp2_reshard_after_forward", True),
                         getattr(args, "fsdp2_reduce_dtype", "fp32"))
 
@@ -2679,9 +2679,10 @@ def parse_args() -> argparse.Namespace:
         help="Turn off --fsdp2_reshard_after_forward.",
     )
     p.add_argument(
-        "--fsdp2_group_layers", action="store_true",
-        help="With --fsdp2: shard each unique layer's attention and FFN as one group (gathered and resharded "
-             "together) instead of one unit per module: half the hook calls and collectives.",
+        "--fsdp2_layers_per_group", type=int, default=0,
+        help="With --fsdp2: shard this many consecutive unique layers' attention and FFN as one group (gathered and "
+             "resharded together; groups stay inside or outside the looped core). 0 = one unit per attn / ffn "
+             "module. Fewer groups = fewer hook calls and collectives, more weights gathered at once.",
     )
     p.add_argument(
         "--fsdp2_reduce_dtype", choices=("fp32", "bf16"), default="fp32",
