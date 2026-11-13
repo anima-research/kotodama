@@ -382,6 +382,30 @@ def _hsdp_worker(rank: int, world: int, init_file: str) -> None:
     dist.destroy_process_group()
 
 
+def _hsdp_once_per_step_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (2, world // 2), mesh_dim_names=("replicate", "shard"))
+    ref = _reference()
+    every, once = _sharded(ref, mesh), _sharded(ref, mesh)
+    micros = 3
+    for m, deferred in ((every, False), (once, True)):
+        for k in range(micros):
+            if deferred:
+                m.set_requires_all_reduce(k == micros - 1)
+            ids = _batch(k, rank)
+            (m(ids, labels=ids)["loss"] / micros).backward()
+    for (name, p), q in zip(every.named_parameters(), once.parameters()):
+        if p.grad is not None:
+            assert _rel(_full(q.grad), _full(p.grad)) < 1e-5, name
+    dist.destroy_process_group()
+
+
+def test_hsdp_all_reduce_once_per_step_matches_every_micro(tmp_path):
+    _spawn(_hsdp_once_per_step_worker, 4, tmp_path)
+
+
 def test_hsdp_replicas_stay_identical(tmp_path):
     _spawn(_hsdp_worker, 4, tmp_path)
 
