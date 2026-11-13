@@ -1,7 +1,8 @@
 #!/bin/bash
 # One arm of the FSDP2 parity gate (scripts/utils/fsdp2_parity.py compares the arms): the kotodama-tsumugi shape,
 # eager, at a test batch of 24 sequences x 4096 tokens (divisible by 2, 4 and 6 ranks), seed 17 / data seed 42.
-# Weights-only saves after the first step, at STEPS/4 and at the end; the log is written to OUT/train.log.
+# Weights-only saves after the first step, at STEPS/4 and at the end; the log is written to OUT/train.log. A run that
+# resumes from a sharded checkpoint already in OUT appends to that log, so it holds the whole run from step 0.
 #
 # Usage: scripts/utils/fsdp2_gate.sh ARM WORLD OUT DATA_PATH [STEPS] [extra train flags...]
 #   ARM  ddp      the reference: DDP, micro-batch 2
@@ -25,6 +26,8 @@ SEQ=4096; SEQS=24; T=$((SEQ * SEQS)); Q=$((STEPS / 4))
 [ "$Q" -ge 2 ] || { echo "STEPS must be >= 8" >&2; exit 2; }
 SCHEDULE="$T:$T,$(( (Q - 1) * T )):$(( Q * T )),$(( (STEPS - Q) * T )):$(( STEPS * T ))"
 mkdir -p "$OUT"
+TEE=(tee)
+if compgen -G "$OUT/step_*.dcp" > /dev/null; then TEE=(tee -a); fi
 export KOTODAMA_NPROC="$WORLD"
 export KOTODAMA_DEBUG_BATCH_HASH="${KOTODAMA_DEBUG_BATCH_HASH:-20}"
 # One telemetry series per arm when several arms share a scheduler job.
@@ -36,4 +39,4 @@ echo "fsdp2-gate arm=$ARM world=$WORLD steps=$STEPS micro_batch=$MB schedule=$SC
   --total_steps "$STEPS" --warmup_steps 20 --log_every 1 --norm_gain_every 10 \
   --save_every 0 --save_schedule "$SCHEDULE" --anchor_tokens '' \
   --checkpoint_dir "$OUT" --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-gate-$ARM-w$WORLD" \
-  "$@" 2>&1 | tee "$OUT/train${LOGSUFFIX}.log"
+  "$@" 2>&1 | "${TEE[@]}" "$OUT/train${LOGSUFFIX}.log"
