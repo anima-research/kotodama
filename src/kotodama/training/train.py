@@ -2629,6 +2629,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable torch.compile for throughput",
     )
     p.add_argument(
+        "--no_compile", dest="compile", action="store_false",
+        help="Turn off --compile set by a config (eager).",
+    )
+    p.add_argument(
         "--compile_mode",
         type=str,
         default=None,
