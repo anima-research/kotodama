@@ -38,6 +38,10 @@ reaches the same eval points; each point issues a fixed number of collectives
 (one all-reduce of the SIGTERM flag, one gather) whatever suites fail, and
 suite errors are caught per rank and reported by rank 0 — never a deadlock.
 A SIGTERM on any rank skips the eval point on all of them.
+
+FSDP2 safety: a sharded model's every forward is collective (each unit gathers its shards), so the ranks must make
+the same number of forward calls although their shards batch differently. :class:`Lockstep` pads them: one scalar
+all-reduce before each forward, and a rank whose shard is done makes tiny forwards until every rank is done.
 """
 
 from __future__ import annotations
@@ -236,10 +240,45 @@ class InloopConfig:
         )
 
 
+class Lockstep:
+    """Forward calls in lockstep across ranks, for a sharded (FSDP2) model whose forward is collective.
+
+    Each real call first all-reduces (MAX) a "this rank has a batch" flag over ``group``; :meth:`drain`, called by
+    every rank once its own work is done (also after an error), keeps making a tiny forward while any rank still
+    reports work. Every rank therefore makes the same sequence of forwards, so FSDP's gathers always pair up."""
+
+    def __init__(self, fn: Callable[[torch.Tensor], Any], device: torch.device, group: Any = None) -> None:
+        self.fn, self.device, self.group = fn, device, group
+        self.real_calls = 0
+        self.pad_calls = 0
+
+    def _any(self, mine: bool) -> bool:
+        flag = torch.tensor([1.0 if mine else 0.0], device=self.device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.group)
+        return bool(flag.item() > 0)
+
+    def __call__(self, ids: torch.Tensor) -> Any:
+        self._any(True)
+        self.real_calls += 1
+        return self.fn(ids)
+
+    def drain(self) -> None:
+        pad = torch.zeros((1, 8), dtype=torch.long, device=self.device)
+        while self._any(False):
+            self.fn(pad)
+            self.pad_calls += 1
+
+
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     """The raw module: out of DDP (``.module``) and torch.compile (``._orig_mod``)."""
     m = model.module if hasattr(model, "module") else model
     return getattr(m, "_orig_mod", m)
+
+
+def _is_sharded(model: torch.nn.Module) -> bool:
+    from kotodama.training.fsdp import is_fsdp2
+
+    return is_fsdp2(model)
 
 
 def _load_tokenizer() -> Any:
@@ -570,7 +609,9 @@ class InloopEvaluator:
         raw.eval()
         local: dict[str, dict[str, Any]] = {}
         try:
-            model_fn = self._model_fn(raw)
+            model_fn: Any = self._model_fn(raw)
+            if self._distributed() and _is_sharded(raw):
+                model_fn = Lockstep(model_fn, self.device)
             with torch.no_grad():
                 for suite in self.cfg.suites:
                     ts = time.time()
@@ -582,6 +623,8 @@ class InloopEvaluator:
                         local[suite] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
                         if self.device.type == "cuda":
                             torch.cuda.empty_cache()
+                    if isinstance(model_fn, Lockstep):
+                        model_fn.drain()
                     local[suite]["time_s"] = time.time() - ts
         finally:
             raw.train(was_training)

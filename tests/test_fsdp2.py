@@ -261,6 +261,31 @@ def test_compiled_units_match_eager_units(tmp_path):
     _spawn(_compile_worker, 2, tmp_path)
 
 
+# ── in-loop evals: uneven forward counts in lockstep ─────────────────────────
+
+
+def _lockstep_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.inloop import Lockstep
+
+    _init(rank, world, init_file)
+    ref = _reference().eval()
+    model = _sharded(ref, init_device_mesh("cpu", (world,))).eval()
+    step = Lockstep(lambda ids: model(ids)["logits"], torch.device("cpu"))
+    with torch.no_grad():
+        for k in range(rank + 1):  # rank r makes r + 1 real forwards
+            ids = _batch(k, rank)
+            assert torch.allclose(step(ids), ref(ids)["logits"], atol=1e-5, rtol=1e-4)
+        step.drain()
+    assert step.real_calls == rank + 1 and step.real_calls + step.pad_calls == world
+    dist.destroy_process_group()
+
+
+def test_lockstep_pads_uneven_forward_counts(tmp_path):
+    _spawn(_lockstep_worker, 3, tmp_path)
+
+
 # ── HSDP ─────────────────────────────────────────────────────────────────────
 
 
@@ -402,7 +427,8 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
 
     ok = argparse.Namespace(fsdp2=True, fsdp2_replicas=2, tp_size=1, fp8=False, geo_monitor=False, inloop_evals="")
     validate_fsdp2_args(ok)
-    for bad in (dict(tp_size=2), dict(fp8=True), dict(geo_monitor=True), dict(inloop_evals="riders")):
+    validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "inloop_evals": "riders,induction"}))
+    for bad in (dict(tp_size=2), dict(fp8=True), dict(geo_monitor=True)):
         with pytest.raises(ValueError, match="does not support"):
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):

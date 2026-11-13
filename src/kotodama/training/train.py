@@ -1489,9 +1489,17 @@ def train(args: argparse.Namespace) -> None:
         # on random init) and every later step one multiplier behind.
         scheduler.step(step)
 
-        # Optimizer step
+        # Optimizer step (--time_optimizer_step: wall time of the two steps on log steps, between device syncs)
+        _time_opt = getattr(args, "time_optimizer_step", False) and (
+            step % args.log_every == 0 or step == loop_end - 1)
+        if _time_opt:
+            torch.cuda.synchronize(device)
+            _t_opt = time.perf_counter()
         muon_opt.step()
         adamw_opt.step()
+        if _time_opt:
+            torch.cuda.synchronize(device)
+            _opt_step_s = time.perf_counter() - _t_opt
         muon_opt.zero_grad(set_to_none=True)
         adamw_opt.zero_grad(set_to_none=True)
 
@@ -1540,6 +1548,10 @@ def train(args: argparse.Namespace) -> None:
                 tokens_consumed / 1e9,
                 gpu_mem,
             )
+            if _time_opt:
+                logger.info("  opt_step=%.4fs (%.2f%% of the mean step %.3fs)", _opt_step_s,
+                            100.0 * _opt_step_s / max(elapsed / max(log_steps, 1), 1e-9),
+                            elapsed / max(log_steps, 1))
 
             if wb is not None:
                 wb.log_step(
@@ -1579,7 +1591,8 @@ def train(args: argparse.Namespace) -> None:
                        "perf/step_time_s": elapsed / max(log_steps, 1),
                        "perf/data_wait_s_per_step": data_wait_per_step,
                        "perf/gpu_mem_gb": gpu_mem,
-                       "perf/mfu": mfu},
+                       "perf/mfu": mfu,
+                       **({"perf/opt_step_s": _opt_step_s} if _time_opt else {})},
                 )
 
             if _norm_gains is not None:
@@ -2122,8 +2135,6 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
         "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
         "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
-        "--inloop_evals (ranks run different prompt counts; pass --inloop_evals '')": bool(
-            getattr(args, "inloop_evals", None)),
     }
     bad = [name for name, on in unsupported.items() if on]
     if bad:
@@ -2622,6 +2633,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no_fsdp2_reshard_after_forward", dest="fsdp2_reshard_after_forward", action="store_false",
         help="Turn off --fsdp2_reshard_after_forward.",
+    )
+    p.add_argument(
+        "--time_optimizer_step", action="store_true",
+        help="On log steps, time the optimizer step between device syncs: perf/opt_step_s and an opt_step= field "
+             "in the log line.",
     )
     p.add_argument(
         "--rank_data_guard_steps", type=int, default=20,
