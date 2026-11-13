@@ -236,6 +236,31 @@ def test_fsdp2_matches_unsharded_model(tmp_path):
     _spawn(_parity_worker, 3, tmp_path)
 
 
+# ── compile inside the units ─────────────────────────────────────────────────
+
+
+def _compile_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_units, fsdp_units
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    ref = _reference()
+    plain, compiled = _sharded(ref, mesh), _sharded(ref, mesh)
+    assert compile_fsdp_units(fsdp_units(compiled), backend="eager") == 2  # GQAttention, SwiGLUFFN
+    for m in (plain, compiled):
+        m(_batch(0, rank), labels=_batch(0, rank))["loss"].backward()
+    for (name, p), q in zip(plain.named_parameters(), compiled.parameters()):
+        if p.grad is not None:
+            assert torch.equal(_full(p.grad), _full(q.grad)), name
+    dist.destroy_process_group()
+
+
+def test_compiled_units_match_eager_units(tmp_path):
+    _spawn(_compile_worker, 2, tmp_path)
+
+
 # ── HSDP ─────────────────────────────────────────────────────────────────────
 
 

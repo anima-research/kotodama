@@ -177,6 +177,24 @@ def apply_fsdp2(
     return units
 
 
+def compile_fsdp_units(units: list[nn.Module], **compile_kwargs: Any) -> int:
+    """torch.compile inside the FSDP units: each unit's ``forward`` is replaced by one compiled function per module
+    class, shared by every unit of that class (parameters are graph inputs, so the loop repeats and every layer reuse
+    the trace). FSDP's gather/reshard hooks run in ``__call__`` around ``forward``, outside every compiled region;
+    the AttnRes routing, pre-norms and residual adds between units run eagerly. Returns the number of classes
+    compiled."""
+    import types
+
+    compiled: dict[type, Any] = {}
+    for unit in units:
+        cls = type(unit)
+        base = next(c for c in cls.__mro__ if "forward" in vars(c) and not c.__name__.startswith("FSDP"))
+        if base not in compiled:
+            compiled[base] = torch.compile(base.forward, **compile_kwargs)
+        unit.forward = types.MethodType(compiled[base], unit)
+    return len(compiled)
+
+
 def is_fsdp2(model: nn.Module) -> bool:
     """True when ``model`` (or the module it wraps) has been through :func:`apply_fsdp2`."""
     from torch.distributed.fsdp import FSDPModule

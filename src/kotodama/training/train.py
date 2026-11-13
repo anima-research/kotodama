@@ -761,7 +761,14 @@ def train(args: argparse.Namespace) -> None:
                 logger.info(
                     "Inductor activation_memory_budget=%.2f (partitioner-driven "
                     "selective recompute; manual AC off)", ac_budget)
-        if getattr(args, "compile_regional", False):
+        if use_fsdp2:
+            from kotodama.training.fsdp import compile_fsdp_units
+
+            _n_cls = compile_fsdp_units(_units, mode=compile_mode)
+            if is_main:
+                logger.info("FSDP2 compile: inside the units (%d compiled forwards; gather hooks, routing and "
+                            "pre-norms eager between them; mode=%s)", _n_cls, compile_mode)
+        elif getattr(args, "compile_regional", False):
             if is_main:
                 logger.info("Regional compile: per-layer attn/MLP sublayers (mode=%s)...", compile_mode)
             model.compile_regions(mode=compile_mode)
