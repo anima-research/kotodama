@@ -194,6 +194,18 @@ def check_rank_batches_distinct(ids: torch.Tensor, group: Any, device: torch.dev
     return digests
 
 
+def check_finite_loss(step_loss: float, step: int, device: torch.device, checkpoint_dir: Any) -> None:
+    """Stop the run, on every rank at once, when any rank's step loss is non-finite: before the optimizer step and
+    before any save, so NaN weights are never trained on or written over the last good checkpoint (an auto-retry
+    then resumes from that checkpoint). Collective when distributed."""
+    bad = torch.tensor([0.0 if math.isfinite(step_loss) else 1.0], device=device)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+    if bad.item() > 0:
+        raise RuntimeError(f"non-finite loss at step {step} (this rank: {step_loss}); exiting without saving "
+                           f"(the last good checkpoint in {checkpoint_dir} is untouched)")
+
+
 FROZEN_ROUTING_CHECK_STEP = 50
 
 
@@ -1439,6 +1451,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Single GPU→CPU sync after all micro-steps
         step_loss = _loss_accum.item() / current_grad_accum
+        check_finite_loss(step_loss, step, device, args.checkpoint_dir)
         step_z_loss = _z_loss_accum.item() / current_grad_accum
 
         # TP: sync QK-norm gradients (they see sharded heads, need SUM)

@@ -31,7 +31,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from kotodama.training.fsdp import full_model_state_dict, is_fsdp2
+from kotodama.training.fsdp import full_model_state_dict, is_dtensor, is_fsdp2
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,28 @@ class TokenThresholds:
         return len(self._t)
 
 
+def require_finite_params(model: torch.nn.Module, what: str) -> None:
+    """Refuse to save non-finite weights, on every rank at once.
+
+    Every save calls this first, before writing or rotating anything, so a run whose weights went NaN/inf cannot
+    write them over (or rotate out) the last good checkpoint. Counts non-finite elements in each rank's own
+    parameters (its shards under FSDP2) and all-reduces the count, so all ranks raise together. Collective."""
+    raw = _unwrap(model)
+    params = list(raw.parameters())
+    if not params:
+        return
+    first = params[0].to_local() if is_dtensor(params[0]) else params[0]
+    bad = torch.zeros((), dtype=torch.int64, device=first.device)
+    for p in params:
+        t = p.to_local() if is_dtensor(p) else p
+        bad += (~torch.isfinite(t.detach())).sum()
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(bad)
+    if bad.item() > 0:
+        raise RuntimeError(f"refusing to save {what}: {int(bad.item())} non-finite parameter values "
+                           "(the existing checkpoints are untouched)")
+
+
 def save_weights_only(
     directory: str | Path,
     step: int,
@@ -115,6 +137,7 @@ def save_weights_only(
     "tokens_consumed"}``) — the formation-ladder cadence save. Never pruned.
     All ranks must call (barrier); rank 0 writes. A sharded (FSDP2) model is gathered first (collective) and
     written as bf16, the same file the unsharded path writes."""
+    require_finite_params(model, f"weights at step {step}")
     path: Optional[Path] = None
     raw = model.module if hasattr(model, "module") else model
     raw = getattr(raw, "_orig_mod", raw)
@@ -197,8 +220,10 @@ class CheckpointManager:
         extra: Optional[dict[str, Any]] = None,
     ) -> Optional[Path]:
         """
-        Save a checkpoint.  Returns the path on rank 0, None on other ranks.
+        Save a checkpoint.  Returns the path on rank 0, None on other ranks. Refuses non-finite weights
+        (:func:`require_finite_params`) before writing or rotating anything.
         """
+        require_finite_params(model, f"checkpoint step {step}")
         path: Optional[Path] = None
 
         if self.rank == 0:
@@ -403,7 +428,8 @@ class AsyncCheckpointManager(CheckpointManager):
         data_state: Optional[dict[str, Any]] = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> Optional[Path]:
-        """Synchronous CPU clone + async SHM write."""
+        """Synchronous CPU clone + async SHM write (non-finite weights refused first, on every rank)."""
+        require_finite_params(model, f"checkpoint step {step}")
         if self.rank != 0:
             if dist.is_initialized() and dist.get_world_size() > 1:
                 dist.barrier()
@@ -761,6 +787,7 @@ class ShardedCheckpointManager(CheckpointManager):
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.state_dict import get_state_dict
 
+        require_finite_params(model, f"sharded checkpoint step {step}")
         path = self.checkpoint_dir / f"step_{step:08d}.dcp"
         tmp = path.with_name(path.name + ".tmp")
         if self.rank == 0 and tmp.exists():
