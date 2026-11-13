@@ -52,6 +52,11 @@ SHAPES: dict[str, dict[str, Any]] = {
     "1b-tsumugi": dict(hidden_size=1536, num_layers=72, num_attention_heads=12,
                              num_kv_heads=6, head_dim=128, intermediate_size=4096,
                              loop_start=19, loop_len=20, loop_times=2, **_COMMON),
+    # A ~9.2B deep-narrow benchmark shape for multi-GPU throughput (not a trained model): d3584, 80 effective
+    # layers from 64 unique ones = 24 prelude + a 16-layer core run 2x + 24 coda; heads 28 / kv 14, FFN 9472.
+    "10b-bench-loop": dict(hidden_size=3584, num_layers=80, num_attention_heads=28,
+                           num_kv_heads=14, head_dim=128, intermediate_size=9472,
+                           loop_start=24, loop_len=16, loop_times=2, **_COMMON),
     # d1024 x 28 (~0.38B with tied embeddings) — between the proxy and the 1b.
     "intermediate": dict(hidden_size=1024, num_layers=28, num_attention_heads=8,
                          num_kv_heads=4, head_dim=128, intermediate_size=2816, **_COMMON),

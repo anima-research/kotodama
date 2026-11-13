@@ -15,11 +15,15 @@
 # second half of the steps: mean tok/s, MFU, optimizer share, peak memory, mean power and clock, and the share of
 # samples throttled by the software power cap, bit 0x4) is printed at the end and written to OUT/summary.md.
 #
-# Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS]
+# Usage: scripts/utils/fsdp2_throughput.sh WORLD OUT DATA_PATH [STEPS] [RUNS] [extra train flags...]
 #   RUNS: comma list of run names (default: ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,
-#         fsdp2-layer-mxfp8; also fsdp2-zero2, fsdp2-defer, fsdp2-mb16, fsdp2-layer-flat)
+#         fsdp2-layer-mxfp8; also fsdp2-zero2, fsdp2-defer, fsdp2-mb16, fsdp2-layer-flat, fsdp2-group2,
+#         fsdp2-group4: two or four consecutive layers per shard group)
+#   Extra train flags come last on every run's command line, so they override the recipe and the run's own flags
+#   (another shape: --model_size NAME --attn_res_n_blocks N --micro_batch_size 1 --global_batch_tokens T).
 set -uo pipefail
 WORLD="$1"; OUT="$2"; DATA="$3"; STEPS="${4:-40}"; RUNS="${5:-ddp,ddp-regional,fsdp2,fsdp2-layer,fsdp2-layer-zero2,fsdp2-layer-mb16,fsdp2-layer-mxfp8}"
+shift $(( $# < 5 ? $# : 5 )); USER_EXTRA=("$@")
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Several nodes: node 0 writes train.log, node k train.node<k>.log; only node 0 post-processes.
 LOGSUFFIX=""
@@ -49,6 +53,8 @@ for name in "${LIST[@]}"; do
     fsdp2-layer-mxfp8) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
     fsdp2-layer-flat) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8) ;;
+    fsdp2-group2) EXTRA=(--fsdp2 --fsdp2_layers_per_group 2 --micro_batch_size 8) ;;
+    fsdp2-group4) EXTRA=(--fsdp2 --fsdp2_layers_per_group 4 --micro_batch_size 8) ;;
     *) echo "unknown run $name" >&2; exit 2 ;;
   esac
   if [[ "$name" == fsdp2* && "$name" != *-flat ]]; then EXTRA+=("${REPL[@]}"); fi
@@ -67,7 +73,7 @@ for name in "${LIST[@]}"; do
   nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "$CUDA_VISIBLE_DEVICES"} \
     --query-gpu=timestamp,index,power.draw,clocks.sm,clocks_throttle_reasons.active --format=csv,noheader,nounits -l 5 > "$OUT/$name/power${LOGSUFFIX}.csv" 2>/dev/null &
   SAMPLER=$!
-  KOTODAMA_SCHEDULER_METRIC_PREFIX="$name" KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
+  KOTODAMA_SCHEDULER_METRIC_PREFIX="$name" KOTODAMA_VENV="$RUN_VENV" "$ROOT/tools/run_train.sh" "${COMMON[@]}" "${EXTRA[@]}" "${USER_EXTRA[@]}" --checkpoint_dir "$OUT/$name" \
     --checkpoint_shm_dir "/dev/shm/kotodama-fsdp2-g8-$name" 2>&1 | tee "$OUT/$name/train${LOGSUFFIX}.log"
   echo "=== $name exit ${PIPESTATUS[0]} $(date -u +%H:%M:%S) ==="
   kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
