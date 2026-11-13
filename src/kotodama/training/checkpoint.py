@@ -18,6 +18,7 @@ Async mode (AsyncCheckpointManager):
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import signal
 import subprocess
@@ -29,6 +30,8 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+
+from kotodama.training.fsdp import full_model_state_dict, is_fsdp2
 
 logger = logging.getLogger(__name__)
 
@@ -110,17 +113,21 @@ def save_weights_only(
 ) -> Optional[Path]:
     """Model-only checkpoint in the ``kotodama.ckpt`` format (``{"model", "step",
     "tokens_consumed"}``) — the formation-ladder cadence save. Never pruned.
-    All ranks must call (barrier); rank 0 writes."""
+    All ranks must call (barrier); rank 0 writes. A sharded (FSDP2) model is gathered first (collective) and
+    written as bf16, the same file the unsharded path writes."""
     path: Optional[Path] = None
+    raw = model.module if hasattr(model, "module") else model
+    raw = getattr(raw, "_orig_mod", raw)
+    full_sd: Optional[dict[str, torch.Tensor]] = None
+    if is_fsdp2(raw):
+        full_sd = full_model_state_dict(raw, dtype=torch.bfloat16)
     if rank == 0:
         d = Path(directory)
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"step_{step:08d}.pt"
-        raw = model.module if hasattr(model, "module") else model
-        raw = getattr(raw, "_orig_mod", raw)
         t0 = time.time()
         tmp = path.with_suffix(".tmp")
-        torch.save({"model": raw.state_dict(), "step": step,
+        torch.save({"model": full_sd if full_sd is not None else raw.state_dict(), "step": step,
                     "tokens_consumed": tokens_consumed}, tmp)
         tmp.rename(path)
         logger.info("Weights saved: %s (%.1fs, %.2fB tokens)",
@@ -724,3 +731,130 @@ class AsyncCheckpointManager(CheckpointManager):
         self._worker.join(timeout=120)
         if self._worker.is_alive():
             logger.warning("Async checkpoint worker did not finish within timeout")
+
+
+_DCP_NAME = re.compile(r"^step_(\d{8})\.dcp$")
+
+
+class ShardedCheckpointManager(CheckpointManager):
+    """Checkpoints of an FSDP2-sharded run, as torch.distributed.checkpoint (DCP) directories.
+
+    ``step_XXXXXXXX.dcp/`` holds the sharded model and both optimizers (every rank writes its own shards, so the
+    checkpoint directory must be one filesystem all ranks see) plus ``meta.pt`` (step, tokens, scheduler, data
+    position and the run's extras, written by rank 0). A save goes to ``<name>.tmp`` and is renamed only once every
+    rank has finished, so an interrupted save is never mistaken for a checkpoint. Resume reshards on load, so the
+    world size may change between save and resume."""
+
+    META = "meta.pt"
+
+    def save(
+        self,
+        step: int,
+        model: torch.nn.Module,
+        muon_opt: torch.optim.Optimizer,
+        adamw_opt: torch.optim.Optimizer,
+        scheduler: Any,
+        tokens_consumed: int = 0,
+        data_state: Optional[dict[str, Any]] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import get_state_dict
+
+        path = self.checkpoint_dir / f"step_{step:08d}.dcp"
+        tmp = path.with_name(path.name + ".tmp")
+        if self.rank == 0 and tmp.exists():
+            shutil.rmtree(tmp)  # an earlier interrupted save of this very step
+        _barrier()
+        t0 = time.time()
+        raw = _unwrap(model)
+        msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
+        dcp.save({"model": msd, "optim": osd}, checkpoint_id=str(tmp))
+        if self.rank == 0:
+            meta: dict[str, Any] = {
+                "step": step,
+                "tokens_consumed": tokens_consumed,
+                "scheduler": _scheduler_state(scheduler),
+                "ns_coefficients": getattr(muon_opt, "_ns_coefficients", None),
+                "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            }
+            if data_state is not None:
+                meta["data"] = data_state
+            if extra is not None:
+                meta.update(extra)
+            torch.save(meta, tmp / self.META)
+        _barrier()
+        if self.rank == 0:
+            tmp.rename(path)
+            logger.info("Sharded checkpoint saved: %s (%.1fs)", path, time.time() - t0)
+            self._cleanup_old(keep=self.keep_last_n)
+        _barrier()
+        return path if self.rank == 0 else None
+
+    def save_blocking(self, **kwargs: Any) -> Optional[Path]:
+        return self.save(**kwargs)
+
+    def latest(self) -> Optional[Path]:
+        """The newest complete ``step_*.dcp`` directory, or None."""
+        found = sorted(d for d in self.checkpoint_dir.glob("step_*.dcp")
+                       if _DCP_NAME.match(d.name) and (d / self.META).exists())
+        return found[-1] if found else None
+
+    def load_latest(
+        self,
+        model: torch.nn.Module,
+        muon_opt: torch.optim.Optimizer,
+        adamw_opt: torch.optim.Optimizer,
+        device: torch.device,
+    ) -> Optional[dict[str, Any]]:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+        latest = self.latest()
+        if latest is None:
+            unsharded = sorted(self.checkpoint_dir.glob("step_*.pt")) + sorted(self.checkpoint_dir.glob("step_*.pt.zst"))
+            if unsharded:
+                raise RuntimeError(
+                    f"{self.checkpoint_dir} holds unsharded checkpoints ({unsharded[-1].name}) but no sharded ones; "
+                    "an FSDP2 run resumes only from step_*.dcp (refusing to start over at step 0)")
+            return None
+        logger.info("Loading sharded checkpoint: %s", latest)
+        raw = _unwrap(model)
+        msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
+        state = {"model": msd, "optim": osd}
+        dcp.load(state, checkpoint_id=str(latest))
+        set_state_dict(raw, [muon_opt, adamw_opt], model_state_dict=state["model"], optim_state_dict=state["optim"])
+        meta = torch.load(latest / self.META, map_location="cpu", weights_only=False)
+        ns = meta.get("ns_coefficients")
+        if ns is not None and getattr(muon_opt, "_ns_coefficients", ns) != ns:
+            logger.warning("Muon ns_coefficients mismatch: checkpoint has %r, CLI has %r. Using the checkpoint's.",
+                           ns, muon_opt._ns_coefficients)
+            muon_opt._ns_coefficients = ns
+        logger.info("Resumed from step %d (%.2fB tokens; saved at world size %s)", meta["step"],
+                    meta.get("tokens_consumed", 0) / 1e9, meta.get("world_size"))
+        return meta
+
+    def _cleanup_old(self, keep: int = 5) -> None:
+        """Remove old sharded checkpoints, keeping the newest ``keep`` (<=0 keeps all). Only directories named
+        ``step_XXXXXXXX.dcp`` directly inside the checkpoint dir, holding a DCP ``.metadata``, are removed."""
+        if keep <= 0:
+            return
+        found = sorted(d for d in self.checkpoint_dir.glob("step_*.dcp") if _DCP_NAME.match(d.name))
+        for old in found[:-keep]:
+            if old.parent != self.checkpoint_dir or not old.is_dir() or not (old / ".metadata").exists():
+                logger.warning("Not removing %s: not a complete sharded checkpoint", old)
+                continue
+            try:
+                shutil.rmtree(old)
+            except OSError as e:
+                logger.warning("Failed to remove %s: %s", old, e)
+
+
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    raw = model.module if hasattr(model, "module") else model
+    return getattr(raw, "_orig_mod", raw)
+
+
+def _barrier() -> None:
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()

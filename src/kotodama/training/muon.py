@@ -28,6 +28,8 @@ from typing import Any, Optional
 import torch
 from torch.optim import AdamW, Optimizer
 
+from kotodama.training.fsdp import is_dtensor, shard_group, shard_rows
+
 logger = logging.getLogger(__name__)
 
 
@@ -190,6 +192,126 @@ def _batched_newton_schulz(
     return X.to(orig_dtype)
 
 
+def _orthogonalize_by_shape(
+    mats: dict[int, torch.Tensor],
+    num_iterations: int,
+    ns_coefficients: Optional[str],
+) -> dict[int, torch.Tensor]:
+    """Newton-Schulz every matrix in ``mats`` (index -> 2-D matrix), one batched call per shape.
+
+    Matrices of one shape run as a single batched NS in index order; a shape with one matrix runs the 2-D kernel.
+    Returns index -> orthogonalized matrix (the input dtype)."""
+    shape_groups: dict[tuple[int, int], list[int]] = {}
+    for i, M in mats.items():
+        shape_groups.setdefault((M.shape[0], M.shape[1]), []).append(i)
+    out: dict[int, torch.Tensor] = {}
+    for indices in shape_groups.values():
+        if len(indices) == 1:
+            idx = indices[0]
+            out[idx] = newton_schulz_orthogonalize(
+                mats[idx], num_iterations=num_iterations, ns_coefficients=ns_coefficients)
+        else:
+            result = _batched_newton_schulz(
+                torch.stack([mats[i] for i in indices]), num_iterations, ns_coefficients=ns_coefficients)
+            for j, idx in enumerate(indices):
+                out[idx] = result[j]
+    return out
+
+
+def assign_owners(shapes: list[tuple[int, int]], world: int) -> list[int]:
+    """Owner rank per matrix for sharded Newton-Schulz: greedy on NS cost (rows * cols * min(rows, cols)), largest
+    first, ties by index. Deterministic from the shapes alone, so every rank derives the same plan."""
+    loads = [0] * world
+    owner = [0] * len(shapes)
+    order = sorted(range(len(shapes)),
+                   key=lambda i: (-(shapes[i][0] * shapes[i][1] * min(shapes[i])), i))
+    for i in order:
+        r = loads.index(min(loads))
+        owner[i] = r
+        loads[r] += shapes[i][0] * shapes[i][1] * min(shapes[i])
+    return owner
+
+
+def orthogonalize_sharded(
+    local_updates: list[torch.Tensor],
+    shapes: list[tuple[int, int]],
+    group: Any,
+    world: int,
+    rank: int,
+    num_iterations: int,
+    ns_coefficients: Optional[str],
+) -> list[torch.Tensor]:
+    """Newton-Schulz on row-sharded matrices: each rank passes its local rows of every update matrix (fp32) and gets
+    back its local rows of the orthogonalized matrix (fp32).
+
+    One all-to-all gathers each matrix's row shards onto its owner (:func:`assign_owners`), the owner orthogonalizes
+    its matrices (batched by shape, as the replicated path does), and a second all-to-all returns every rank its rows.
+    The return trip carries fp16, which is exact: NS computes in fp16 and only upcasts its result. Every rank of
+    ``group`` must call this with the same matrices in the same order."""
+    import torch.distributed as dist
+
+    n = len(local_updates)
+    if n == 0:
+        return []
+    rows = [shard_rows(s[0], world) for s in shapes]
+    for i, u in enumerate(local_updates):
+        if u.ndim != 2 or u.shape[0] != rows[i][rank] or u.shape[1] != shapes[i][1]:
+            raise ValueError(f"matrix {i}: local shard {tuple(u.shape)} does not match rank {rank}'s rows "
+                             f"{rows[i][rank]} x {shapes[i][1]} of global shape {shapes[i]} over {world} ranks")
+    device = local_updates[0].device
+    owner = assign_owners(shapes, world)
+    owned = [i for i in range(n) if owner[i] == rank]
+
+    # Gather: to peer k, my rows of every matrix k owns (index order).
+    send_parts: list[torch.Tensor] = []
+    in_splits: list[int] = []
+    for k in range(world):
+        mine = [local_updates[i].float().reshape(-1) for i in range(n) if owner[i] == k]
+        send_parts.extend(mine)
+        in_splits.append(sum(t.numel() for t in mine))
+    send = torch.cat(send_parts) if send_parts else torch.empty(0, device=device)
+    out_splits = [sum(rows[i][s] * shapes[i][1] for i in owned) for s in range(world)]
+    recv = torch.empty(sum(out_splits), dtype=torch.float32, device=device)
+    dist.all_to_all_single(recv, send, out_splits, in_splits, group=group)
+
+    pieces: dict[int, list[torch.Tensor]] = {i: [] for i in owned}
+    off = 0
+    for s in range(world):
+        for i in owned:
+            k = rows[i][s] * shapes[i][1]
+            pieces[i].append(recv[off:off + k].view(rows[i][s], shapes[i][1]))
+            off += k
+    full = {i: torch.cat(pieces[i], dim=0) for i in owned}
+    orth = _orthogonalize_by_shape(full, num_iterations, ns_coefficients)
+
+    # Scatter: to peer s, its rows of every matrix I own.
+    back_parts: list[torch.Tensor] = []
+    in2: list[int] = []
+    for s in range(world):
+        tot = 0
+        for i in owned:
+            start = sum(rows[i][:s])
+            part = orth[i][start:start + rows[i][s]].to(torch.float16).reshape(-1)
+            back_parts.append(part)
+            tot += part.numel()
+        in2.append(tot)
+    send2 = torch.cat(back_parts) if back_parts else torch.empty(0, dtype=torch.float16, device=device)
+    out2 = [sum(rows[i][rank] * shapes[i][1] for i in range(n) if owner[i] == k) for k in range(world)]
+    recv2 = torch.empty(sum(out2), dtype=torch.float16, device=device)
+    dist.all_to_all_single(recv2, send2, out2, in2, group=group)
+
+    result: list[Optional[torch.Tensor]] = [None] * n
+    off = 0
+    for k in range(world):
+        for i in range(n):
+            if owner[i] != k:
+                continue
+            num = rows[i][rank] * shapes[i][1]
+            result[i] = recv2[off:off + num].view(rows[i][rank], shapes[i][1]).float()
+            off += num
+    return result  # type: ignore[return-value]
+
+
 class Muon(Optimizer):
     """
     Muon: Momentum Orthogonalized by Newton-Schulz.
@@ -289,6 +411,11 @@ class Muon(Optimizer):
                 s = saved_state.get(idx, saved_state.get(str(idx)))
                 if not s:
                     continue
+                if is_dtensor(p):  # sharded fp32 params are their own masters
+                    if "master" in s:
+                        p.copy_(s["master"])
+                    self.state[p] = {"momentum_buffer": s["momentum_buffer"].detach().to(dtype=torch.float32)}
+                    continue
                 if "master" in s:
                     master = s["master"].detach().to(device=p.device, dtype=torch.float32)
                 else:
@@ -302,6 +429,37 @@ class Muon(Optimizer):
                 "Muon fp32_master: checkpoint had no fp32 masters (legacy bf16 state) — "
                 "masters initialized from the current params, momentum upcast."
             )
+
+    def _sharded_momentum_update(self, p: Any, momentum: float, nesterov: bool) -> torch.Tensor:
+        """Momentum step on a row-sharded (DTensor) parameter's local rows; returns the local rows of the update.
+
+        Sharded parameters are fp32 and are their own masters (FSDP2 casts them to bf16 for compute), so the state
+        is the fp32 momentum alone, held as a DTensor with the parameter's layout."""
+        if p.dtype != torch.float32:
+            raise ValueError(f"sharded Muon needs fp32 parameters (they are the masters); got {p.dtype}")
+        state = self.state[p]
+        if len(state) == 0:
+            state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+        buf = state["momentum_buffer"].to_local()
+        grad = p.grad.to_local().float()
+        buf.mul_(momentum).add_(grad)
+        return momentum * buf + grad if nesterov else buf.clone()
+
+    def _step_sharded(self, params: list[Any], updates: list[torch.Tensor], lr: float, weight_decay: float,
+                      ns_iterations: int) -> None:
+        """Orthogonalize row-sharded updates (:func:`orthogonalize_sharded`) and apply them to the local rows: the
+        same decay, scale and step as the fp32-master path, on the full matrix's shape."""
+        group, world, rank = shard_group(params[0])
+        for p in params[1:]:
+            if p.device_mesh != params[0].device_mesh or p.placements != params[0].placements:
+                raise ValueError("sharded Muon: every parameter in a group must share one mesh and layout")
+        shapes = [(int(p.shape[0]), int(p.shape[1])) for p in params]
+        orth = orthogonalize_sharded(updates, shapes, group, world, rank, ns_iterations, self._ns_coefficients)
+        for p, o, (rows, cols) in zip(params, orth, shapes):
+            local = p.to_local()
+            if weight_decay > 0:
+                local.mul_(1 - lr * weight_decay)
+            local.add_(o, alpha=-lr * max(1.0, (rows / cols) ** 0.5))
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> torch.Tensor | None:
@@ -322,9 +480,15 @@ class Muon(Optimizer):
             updates_to_orthogonalize: list[torch.Tensor] = []
             scales: list[float] = []
             tp_infos: list[Optional[dict[str, Any]]] = []
+            sharded_params: list[torch.Tensor] = []
+            sharded_updates: list[torch.Tensor] = []
 
             for p in group["params"]:
                 if p.grad is None:
+                    continue
+                if is_dtensor(p):
+                    sharded_params.append(p)
+                    sharded_updates.append(self._sharded_momentum_update(p, momentum, nesterov))
                     continue
 
                 grad = p.grad
@@ -363,6 +527,9 @@ class Muon(Optimizer):
                 params_with_grads.append(p)
                 tp_infos.append(tp_info)
                 scales.append(max(1.0, (update.shape[0] / update.shape[1]) ** 0.5))
+
+            if sharded_params:
+                self._step_sharded(sharded_params, sharded_updates, lr, weight_decay, ns_iterations)
 
             if not params_with_grads:
                 continue
@@ -403,35 +570,10 @@ class Muon(Optimizer):
             # and orthogonalize them as a single batched operation.
             # Under TP, updates are already gathered to full shape,
             # so batching groups match the non-TP case.
-            shape_groups: dict[tuple[int, int], list[int]] = {}
-            for i, M in enumerate(updates_to_orthogonalize):
-                if owned is not None and i not in owned:
-                    continue
-                shape = (M.shape[0], M.shape[1])
-                if shape not in shape_groups:
-                    shape_groups[shape] = []
-                shape_groups[shape].append(i)
-
+            mine = {i: M for i, M in enumerate(updates_to_orthogonalize) if owned is None or i in owned}
             orthogonalized: list[Optional[torch.Tensor]] = [None] * len(updates_to_orthogonalize)
-
-            for shape, indices in shape_groups.items():
-                if len(indices) == 1:
-                    idx = indices[0]
-                    orthogonalized[idx] = newton_schulz_orthogonalize(
-                        updates_to_orthogonalize[idx],
-                        num_iterations=ns_iterations,
-                        ns_coefficients=self._ns_coefficients,
-                    )
-                else:
-                    batch = torch.stack(
-                        [updates_to_orthogonalize[i] for i in indices]
-                    )
-                    result = _batched_newton_schulz(
-                        batch, ns_iterations,
-                        ns_coefficients=self._ns_coefficients,
-                    )
-                    for j, idx in enumerate(indices):
-                        orthogonalized[idx] = result[j]
+            for idx, orth in _orthogonalize_by_shape(mine, ns_iterations, self._ns_coefficients).items():
+                orthogonalized[idx] = orth
 
             if use_dist_ns:
                 # Non-owners receive; owners send. contiguous() — NS may
@@ -624,14 +766,27 @@ class MasterAdamW(Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p]
+                sharded = is_dtensor(p)
                 if len(state) == 0:
                     state["step"] = 0
-                    state["master"] = p.detach().clone().to(torch.float32)
-                    state["exp_avg"] = torch.zeros_like(state["master"])
-                    state["exp_avg_sq"] = torch.zeros_like(state["master"])
-                master = state["master"]
-                m, v = state["exp_avg"], state["exp_avg_sq"]
-                grad = p.grad.detach().to(torch.float32)
+                    if sharded:
+                        # A sharded fp32 parameter is its own master; moments share its layout.
+                        if p.dtype != torch.float32:
+                            raise ValueError(f"sharded MasterAdamW needs fp32 parameters; got {p.dtype}")
+                        state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                    else:
+                        state["master"] = p.detach().clone().to(torch.float32)
+                        state["exp_avg"] = torch.zeros_like(state["master"])
+                        state["exp_avg_sq"] = torch.zeros_like(state["master"])
+                if sharded:
+                    master = p.to_local()
+                    m, v = state["exp_avg"].to_local(), state["exp_avg_sq"].to_local()
+                    grad = p.grad.to_local().detach().to(torch.float32)
+                else:
+                    master = state["master"]
+                    m, v = state["exp_avg"], state["exp_avg_sq"]
+                    grad = p.grad.detach().to(torch.float32)
                 state["step"] += 1
                 t = state["step"]
                 if wd != 0:
@@ -642,7 +797,8 @@ class MasterAdamW(Optimizer):
                 bc2 = 1.0 - beta2 ** t
                 denom = (v.sqrt() / (bc2 ** 0.5)).add_(eps)
                 master.addcdiv_(m, denom, value=-lr / bc1)
-                p.copy_(master.to(p.dtype))
+                if not sharded:
+                    p.copy_(master.to(p.dtype))
         return loss
 
     @torch.no_grad()
@@ -669,6 +825,14 @@ class MasterAdamW(Optimizer):
                 new: dict[str, Any] = {
                     "step": int(step.item() if torch.is_tensor(step) else step)
                 }
+                if is_dtensor(p):  # sharded fp32 params are their own masters
+                    if "master" in s:
+                        p.copy_(s["master"])
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        new[key] = (s[key].detach().to(dtype=torch.float32) if key in s
+                                    else torch.zeros_like(p, dtype=torch.float32))
+                    self.state[p] = new
+                    continue
                 if "master" in s:
                     new["master"] = s["master"].detach().to(
                         device=p.device, dtype=torch.float32)

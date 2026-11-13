@@ -65,12 +65,14 @@ from kotodama.training.checkpoint import (
     AsyncCheckpointManager,
     CheckpointManager,
     SIGTERMHandler,
+    ShardedCheckpointManager,
     TokenThresholds,
     parse_save_schedule,
     parse_token_count,
     save_weights_only,
 )
 from kotodama.training.inloop import InloopConfig, InloopEvaluator
+from kotodama.training.fsdp import is_dtensor, replicate_group, tensor_stats
 from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer, decay_start_step
 
 logger = logging.getLogger(__name__)
@@ -161,6 +163,35 @@ def data_parallel_rank(rank: int, dp_group: Any) -> int:
     if dp_group is not None:
         return dist.get_rank(dp_group)
     return rank
+
+
+def batch_digest(ids: torch.Tensor) -> int:
+    """64-bit digest (signed) of a micro-batch's token ids."""
+    raw = ids.detach().cpu().contiguous().numpy().tobytes()
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "little", signed=True)
+
+
+def check_rank_batches_distinct(ids: torch.Tensor, group: Any, device: torch.device, *, step: int,
+                                micro: int) -> list[int]:
+    """The rank-data guard: every data-parallel replica must train on its own micro-batch.
+
+    Collective over ``group`` (``None`` = the world): each rank contributes :func:`batch_digest` of the token ids it
+    is about to train on. Raises if two ranks hold the same batch (every rank raises, so none deadlocks waiting).
+    Returns the digests in rank order."""
+    mine = torch.tensor([batch_digest(ids)], dtype=torch.int64, device=device)
+    world = dist.get_world_size(group)
+    gathered = [torch.empty_like(mine) for _ in range(world)]
+    dist.all_gather(gathered, mine, group=group)
+    digests = [int(t.item()) for t in gathered]
+    by_digest: dict[int, list[int]] = {}
+    for r, h in enumerate(digests):
+        by_digest.setdefault(h, []).append(r)
+    clashes = [ranks for ranks in by_digest.values() if len(ranks) > 1]
+    if clashes:
+        raise RuntimeError(
+            f"rank-data guard: data-parallel ranks {clashes} hold the same micro-batch at step {step} micro {micro} "
+            "(each replica must read its own partition)")
+    return digests
 
 
 def hm_config(config: dict[str, Any]) -> None:
@@ -430,6 +461,8 @@ def setup_logging(rank: int) -> None:
 
 def train(args: argparse.Namespace) -> None:
     # -- Distributed setup -----------------------------------------------------
+    validate_fsdp2_args(args)
+    use_fsdp2 = bool(getattr(args, "fsdp2", False))
     rank, world_size, local_rank = setup_distributed()
     setup_logging(rank)
     device = torch.device(f"cuda:{local_rank}")
@@ -652,6 +685,19 @@ def train(args: argparse.Namespace) -> None:
     # Enable TF32 for fp32 matmuls outside autocast (grad norm, loss compute)
     torch.set_float32_matmul_precision("high")
 
+    # FSDP2: shard after every weight is loaded (and every requires_grad final), before compile.
+    if use_fsdp2:
+        from kotodama.training.fsdp import apply_fsdp2, build_mesh, params_to_fp32
+
+        params_to_fp32(model)
+        fsdp_mesh = build_mesh(world_size, getattr(args, "fsdp2_replicas", 1))
+        _units = apply_fsdp2(model, fsdp_mesh,
+                             reshard_after_forward=getattr(args, "fsdp2_reshard_after_forward", True))
+        if is_main:
+            logger.info("FSDP2: %d units (unique attn/ffn) + root, mesh %s, reshard_after_forward=%s; "
+                        "fp32 sharded params, bf16 compute, fp32 grad reduction",
+                        len(_units), fsdp_mesh, getattr(args, "fsdp2_reshard_after_forward", True))
+
     # Tensor parallelism: shard projection weights across TP group
     if tp_group is not None:
         from kotodama.training.tensor_parallel import apply_tensor_parallelism
@@ -729,7 +775,9 @@ def train(args: argparse.Namespace) -> None:
     # Wrap in DDP for gradient synchronization across data-parallel ranks.
     # Pure TP (tp_size == world_size): no DDP — all ranks are in the same
     # TP group with identical replicated-param gradients.
-    if dp_size > 1:
+    if use_fsdp2:
+        pass  # gradients are reduce-scattered by FSDP2 (every micro-step; sharded grads accumulate in fp32)
+    elif dp_size > 1:
         # With attn_res_freeze_unused, the only never-used params (first
         # boundary layer's pre-attn routing) have requires_grad=False, so DDP
         # can skip the per-iteration unused-param graph traversal entirely.
@@ -954,7 +1002,15 @@ def train(args: argparse.Namespace) -> None:
             )
 
     # -- Checkpoint manager ----------------------------------------------------
-    if getattr(args, "async_checkpoint", False):
+    if use_fsdp2:
+        if getattr(args, "async_checkpoint", False) and is_main:
+            logger.warning("--async_checkpoint: FSDP2 saves are synchronous sharded (DCP) checkpoints")
+        ckpt_mgr = ShardedCheckpointManager(
+            checkpoint_dir=args.checkpoint_dir,
+            rank=rank,
+            keep_last_n=args.keep_checkpoints,
+        )
+    elif getattr(args, "async_checkpoint", False):
         ckpt_mgr = AsyncCheckpointManager(
             checkpoint_dir=args.checkpoint_dir,
             rank=rank,
@@ -999,7 +1055,7 @@ def train(args: argparse.Namespace) -> None:
         anchor_saves = TokenThresholds(
             [parse_token_count(t) for t in args.anchor_tokens.split(",") if t.strip()])
         anchor_saves.skip_through(tokens_consumed)
-        anchor_mgr = CheckpointManager(
+        anchor_mgr = (ShardedCheckpointManager if use_fsdp2 else CheckpointManager)(
             checkpoint_dir=Path(args.checkpoint_dir) / "anchors", rank=rank, keep_last_n=0)
 
     # -- SIGTERM handler -------------------------------------------------------
@@ -1091,7 +1147,7 @@ def train(args: argparse.Namespace) -> None:
                 "adamw_lr": args.adamw_lr,
                 "warmup_steps": args.warmup_steps,
                 "precision": "bf16",
-                "parallelism": f"tp{tp_size}" if tp_size > 1 else "ddp",
+                "parallelism": "fsdp2" if use_fsdp2 else (f"tp{tp_size}" if tp_size > 1 else "ddp"),
                 "tp_size": tp_size,
                 "dp_size": dp_size,
                 "activation_checkpointing": args.activation_checkpointing,
@@ -1223,6 +1279,7 @@ def train(args: argparse.Namespace) -> None:
             "tokens_per_step": tokens_per_step, "micro_batch_size": micro_batch,
             "sequence_length": seq_len, "world_size": world_size,
             "dp_size": dp_size, "tp_size": tp_size, "param_count": param_count,
+            "parallelism": "fsdp2" if use_fsdp2 else (f"tp{tp_size}" if tp_size > 1 else "ddp"),
             "start_step": start_step,
         })
 
@@ -1243,7 +1300,9 @@ def train(args: argparse.Namespace) -> None:
     _gn_win_clipped = torch.zeros((), device=device)
     _loss_win_max = -math.inf
 
-    # Opt-in data-path diagnostic: token-ID hashes of each rank-0 micro-batch.
+    # Rank-data guard (check_rank_batches_distinct) for the first --rank_data_guard_steps steps of every launch.
+    # KOTODAMA_DEBUG_BATCH_HASH=N also logs every rank's batch digests for steps < N (comparable across runs).
+    _guard_steps = int(getattr(args, "rank_data_guard_steps", 20) or 0)
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
 
     for step in range(start_step, loop_end):
@@ -1281,11 +1340,12 @@ def train(args: argparse.Namespace) -> None:
                 batch = next(data_iter)
             log_data_wait += time.perf_counter() - _t_data
 
-            if _debug_hash_steps and step < _debug_hash_steps and is_main:
+            if step - start_step < _guard_steps or step < _debug_hash_steps:
                 _ids = batch["input_ids"] if isinstance(batch, dict) else batch
-                _h = hashlib.md5(_ids.cpu().numpy().tobytes()).hexdigest()[:12]
-                logger.info("batch-hash step=%d micro=%d shape=%s md5=%s",
-                            step, micro_step, tuple(_ids.shape), _h)
+                _digests = check_rank_batches_distinct(_ids, dp_group, device, step=step, micro=micro_step)
+                if is_main and step < _debug_hash_steps:
+                    logger.info("batch-hash step=%d micro=%d shape=%s digests=%s",
+                                step, micro_step, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -1358,8 +1418,13 @@ def train(args: argparse.Namespace) -> None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.gradient_clip
                 )
+        elif use_fsdp2:
+            # max_norm=inf: the total norm of the sharded grads, and a x1.0 (exact) scale
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
         else:
             grad_norm = _compute_grad_norm(model.parameters())
+        if is_dtensor(grad_norm):
+            grad_norm = grad_norm.full_tensor()
 
         _gn_t = grad_norm if isinstance(grad_norm, torch.Tensor) else torch.tensor(float(grad_norm), device=device)
         _gn_win_max = torch.maximum(_gn_win_max, _gn_t.detach().float())
@@ -1388,13 +1453,17 @@ def train(args: argparse.Namespace) -> None:
                     save_weights_only(_sdir, step, model, tokens_consumed, rank=rank)
 
         # Per-layer gradient analysis (before optimizer step clears grads)
-        if wb is not None and step % 50 == 0:
+        # Readers of sharded parameters are collective: under FSDP2 every rank computes, rank 0 logs.
+        if (wb is not None or (use_fsdp2 and args.wandb)) and step % 50 == 0:
             grad_metrics = _per_layer_grad_norms(raw_model)
-            wb.log_custom(step, grad_metrics)
+            if wb is not None:
+                wb.log_custom(step, grad_metrics)
         _ng_every_h = getattr(args, "norm_gain_every", 0)
-        if is_main and _ng_every_h > 0 and (step % _ng_every_h == 0 or step == loop_end - 1):
+        if (is_main or use_fsdp2) and _ng_every_h > 0 and (step % _ng_every_h == 0 or step == loop_end - 1):
             try:
-                hm_log(step, **_layer_health_metrics(raw_model))
+                _health = _layer_health_metrics(raw_model)
+                if is_main:
+                    hm_log(step, **_health)
             except Exception as e:  # telemetry must never stop a run (e.g. sharded params)
                 if not getattr(_layer_health_metrics, "_warned", False):
                     logger.warning("layer health metrics disabled: %s: %s", type(e).__name__, e)
@@ -1429,7 +1498,12 @@ def train(args: argparse.Namespace) -> None:
         _loss_win_max = max(_loss_win_max, step_loss)
         log_steps += 1
 
-        if is_main and (step % args.log_every == 0 or step == loop_end - 1):
+        _log_now = step % args.log_every == 0 or step == loop_end - 1
+        _ng_every = getattr(args, "norm_gain_every", 0)
+        _norm_gains = (_norm_gain_metrics(raw_model)
+                       if (is_main or use_fsdp2) and _log_now and _ng_every > 0
+                       and (step % _ng_every == 0 or step == loop_end - 1) else None)
+        if is_main and _log_now:
             elapsed = time.time() - step_t0
             avg_loss = log_loss_accum / max(log_steps, 1)
             avg_z_loss = log_z_loss_accum / max(log_steps, 1)
@@ -1501,9 +1575,8 @@ def train(args: argparse.Namespace) -> None:
                        "perf/mfu": mfu},
                 )
 
-            _ng_every = getattr(args, "norm_gain_every", 0)
-            if _ng_every > 0 and (step % _ng_every == 0 or step == loop_end - 1):
-                hm_log(step, **_norm_gain_metrics(raw_model))
+            if _norm_gains is not None:
+                hm_log(step, **_norm_gains)
 
             # Reset accumulators
             log_loss_accum = 0.0
@@ -1800,21 +1873,35 @@ def _compute_grad_norm(params: Any) -> torch.Tensor:
 
 
 def param_checksum_spread(model: torch.nn.Module) -> float:
-    """max - min over ranks of a float64 weight checksum. DDP replicas must be
-    bitwise identical, so anything but 0.0 is a silent rank desync (e.g. an
-    in-place weight perturbation that does not restore exactly). 0.0 when not distributed. Collective: every
-    rank must call it."""
-    total = torch.zeros((), dtype=torch.float64)
-    for p in model.parameters():
-        total = total + p.detach().double().sum().cpu()
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() < 2:
+    """max - min over replicas of a float64 weight checksum. Replicas must be bitwise identical, so anything but
+    0.0 is a silent rank desync (e.g. an in-place weight perturbation that does not restore exactly). DDP: every
+    rank is a replica. FSDP2: each rank checksums its own shards and compares them with its HSDP replicas (a plain
+    1-D shard has no replicas: 0.0). 0.0 when not distributed. Collective: every rank must call it."""
+    params = list(model.parameters())
+    if not params or not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() < 2:
         return 0.0
-    dev = next(model.parameters()).device
+    group = None
+    if is_dtensor(params[0]):
+        group = replicate_group(params[0])
+        total = torch.zeros((), dtype=torch.float64, device=params[0].to_local().device)
+        for p in params:
+            total = total + p.to_local().detach().double().sum()
+        if group is None:
+            return 0.0
+        dev = total.device
+    else:
+        total = torch.zeros((), dtype=torch.float64)
+        for p in params:
+            total = total + p.detach().double().sum().cpu()
+        dev = params[0].device
     hi = total.to(dev).clone()
     lo = total.to(dev).clone()
-    dist.all_reduce(hi, op=dist.ReduceOp.MAX)
-    dist.all_reduce(lo, op=dist.ReduceOp.MIN)
-    return (hi - lo).item()
+    dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=group)
+    spread = hi - lo
+    if group is not None:  # one answer on every rank: the worst replica set
+        dist.all_reduce(spread, op=dist.ReduceOp.MAX)
+    return spread.item()
 
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
@@ -1823,25 +1910,28 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:
     """Mean/std of every RMSNorm/QK-norm gain, as telemetry layer families:
     ``norm_gain/layer_{i}/{kind}`` (mean) and ``norm_gain_std/layer_{i}/{kind}``.
-    Non-layer norms land under ``norm_gain/{kind}``. One host sync."""
-    keys: list[str] = []
-    stats: list[torch.Tensor] = []
+    Non-layer norms land under ``norm_gain/{kind}``. One host sync; collective on a sharded model
+    (every rank calls it, rank 0 logs)."""
+    wheres: list[str] = []
+    gains: list[torch.Tensor] = []
     for name, p in model.named_parameters():
         if p.ndim != 1 or not name.endswith("norm.weight"):
             continue
         kind = name.split(".")[-2]
         m = _LAYER_RE.search(name)
-        where = f"layer_{m.group(1)}/{kind}" if m else ("final_norm" if kind == "norm" else kind)
-        g = p.detach().float()
-        keys += [f"norm_gain/{where}", f"norm_gain_std/{where}"]
-        stats += [g.mean(), g.std() if g.numel() > 1 else g.new_zeros(())]
-    if not stats:
-        return {}
-    return dict(zip(keys, torch.stack(stats).tolist()))
+        wheres.append(f"layer_{m.group(1)}/{kind}" if m else ("final_norm" if kind == "norm" else kind))
+        gains.append(p)
+    out: dict[str, float] = {}
+    for where, (s, ss, n) in zip(wheres, tensor_stats(gains)):
+        mean = s / n
+        out[f"norm_gain/{where}"] = mean
+        out[f"norm_gain_std/{where}"] = math.sqrt(max(ss - s * mean, 0.0) / (n - 1)) if n > 1 else 0.0
+    return out
 
 
 def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
-    """Per-layer weight scale, gradient norms and AttnRes router health; one host sync.
+    """Per-layer weight scale, gradient norms and AttnRes router health; one host sync (collective on a sharded
+    model: every rank calls it, rank 0 logs).
 
     Call after backward (and clipping) and before ``zero_grad`` — it reads ``.grad``.
 
@@ -1855,71 +1945,81 @@ def _layer_health_metrics(model: torch.nn.Module) -> dict[str, float]:
       ``router/dead_sites`` counts them (queries with no ``.grad`` — frozen or
       structurally unused, like layer 0's pre-attn — are not sites).
     """
-    keys: list[str] = []
-    vals: list[torch.Tensor] = []
-    grad_sq: dict[str, list[torch.Tensor]] = {}
-    router_grads: list[torch.Tensor] = []
+    # (key, how, tensor index); how: "norm" = sqrt(sum sq), "rms" = sqrt(mean sq), "sq" = summed into a grad key.
+    reads: list[tuple[str, str, int]] = []
+    tensors: list[torch.Tensor] = []
+    router_grad_keys: list[str] = []
+
+    def _read(key: str, how: str, t: torch.Tensor) -> None:
+        reads.append((key, how, len(tensors)))
+        tensors.append(t)
+
     for name, p in model.named_parameters():
         m = _LAYER_RE.search(name)
         leaf = name.split(".")[-2] if name.endswith(".weight") else name.split(".")[-1]
         if name.endswith("res_query"):
             where = (f"layer_{m.group(1)}/{'attn' if leaf == 'attn_res_query' else 'mlp'}"
                      if m else "final")
-            keys.append(f"router/{where}/query_norm"); vals.append(p.detach().float().norm())
+            _read(f"router/{where}/query_norm", "norm", p)
             if p.grad is not None:
-                g = p.grad.detach().float().norm()
-                keys.append(f"router/{where}/grad_norm"); vals.append(g)
-                router_grads.append(g)
+                _read(f"router/{where}/grad_norm", "norm", p.grad)
+                router_grad_keys.append(f"router/{where}/grad_norm")
             continue
         if p.ndim != 2:
             continue
         if m and leaf.endswith("_proj"):
-            keys.append(f"weight_rms/layer_{m.group(1)}/{leaf}")
-            vals.append(p.detach().float().pow(2).mean().sqrt())
+            _read(f"weight_rms/layer_{m.group(1)}/{leaf}", "rms", p)
             if p.grad is not None:
-                sub = "attn" if ".attn." in name else "mlp"
-                grad_sq.setdefault(f"grad/layer_{m.group(1)}/{sub}", []).append(
-                    p.grad.detach().float().pow(2).sum())
+                _read(f"grad/layer_{m.group(1)}/{'attn' if '.attn.' in name else 'mlp'}", "sq", p.grad)
         elif name.endswith("embed_tokens.weight"):
-            keys.append("weight_rms/embed"); vals.append(p.detach().float().pow(2).mean().sqrt())
-    for k, parts in grad_sq.items():
-        keys.append(k); vals.append(torch.stack(parts).sum().sqrt())
-    if router_grads:
-        keys.append("router/dead_sites")
-        vals.append((torch.stack(router_grads) == 0).sum().float())
-    if not vals:
-        return {}
-    return dict(zip(keys, torch.stack(vals).tolist()))
+            _read("weight_rms/embed", "rms", p)
+    stats = tensor_stats(tensors)
+    out: dict[str, float] = {}
+    grad_sq: dict[str, float] = {}
+    for key, how, i in reads:
+        _s, ss, n = stats[i]
+        if how == "sq":
+            grad_sq[key] = grad_sq.get(key, 0.0) + ss
+        else:
+            out[key] = math.sqrt(ss / n if how == "rms" else ss)
+    for key, ss in grad_sq.items():
+        out[key] = math.sqrt(ss)
+    if router_grad_keys:
+        out["router/dead_sites"] = float(sum(out[k] == 0.0 for k in router_grad_keys))
+    return out
 
 
 def _per_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
-    """Compute gradient norms per transformer layer (attn vs MLP split)."""
+    """Gradient norms per transformer layer (attn vs MLP split), every 4th layer and the last; collective on a
+    sharded model."""
     metrics: dict[str, float] = {}
 
     if not hasattr(model, "layers"):
         return metrics
 
+    picks: list[tuple[int, str]] = []
+    grads: list[torch.Tensor] = []
     for i, layer in enumerate(model.layers):
         if i % 4 != 0 and i != len(model.layers) - 1:
             continue
-
-        attn_norms = []
-        mlp_norms = []
-
         for name, param in layer.named_parameters():
             if param.grad is None:
                 continue
-            norm = param.grad.data.float().norm()
             if "attn" in name:
-                attn_norms.append(norm)
+                picks.append((i, "attn"))
             elif "ffn" in name:
-                mlp_norms.append(norm)
-
-        attn_total = torch.stack(attn_norms).square().sum().sqrt().item() if attn_norms else 0.0
-        mlp_total = torch.stack(mlp_norms).square().sum().sqrt().item() if mlp_norms else 0.0
+                picks.append((i, "mlp"))
+            else:
+                continue
+            grads.append(param.grad)
+    sq: dict[tuple[int, str], float] = {}
+    for key, (_s, ss, _n) in zip(picks, tensor_stats(grads)):
+        sq[key] = sq.get(key, 0.0) + ss
+    for i in sorted({i for i, _ in picks}):
+        attn_total = math.sqrt(sq.get((i, "attn"), 0.0))
+        mlp_total = math.sqrt(sq.get((i, "mlp"), 0.0))
         metrics[f"grad/layer_{i}/attn"] = attn_total
         metrics[f"grad/layer_{i}/mlp"] = mlp_total
-
         if mlp_total > 1e-10:
             metrics[f"grad/layer_{i}/attn_mlp_ratio"] = attn_total / (mlp_total + 1e-10)
 
@@ -2000,6 +2100,29 @@ def _micro_summary(rec: dict[str, Any]) -> dict[str, float]:
     except (ValueError, ZeroDivisionError, KeyError) as e:
         logger.debug("micro grad summary skipped: %s", e)
         return {}
+
+
+def validate_fsdp2_args(args: argparse.Namespace) -> None:
+    """Refuse flag combinations --fsdp2 does not support (each would deadlock, double-shard, or read sharded
+    parameters as whole tensors)."""
+    if not getattr(args, "fsdp2", False):
+        if getattr(args, "fsdp2_replicas", 1) != 1:
+            raise ValueError("--fsdp2_replicas needs --fsdp2")
+        return
+    unsupported = {
+        "--tp_size > 1": getattr(args, "tp_size", 1) > 1,
+        "--fp8": getattr(args, "fp8", False),
+        "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
+        "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
+        "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
+        "--inloop_evals (ranks run different prompt counts; pass --inloop_evals '')": bool(
+            getattr(args, "inloop_evals", None)),
+    }
+    bad = [name for name, on in unsupported.items() if on]
+    if bad:
+        raise ValueError("--fsdp2 does not support: " + "; ".join(bad))
+    if getattr(args, "fsdp2_replicas", 1) < 1:
+        raise ValueError("--fsdp2_replicas must be >= 1")
 
 
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
@@ -2353,6 +2476,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable geometric health monitoring (rank 0 only)",
     )
     p.add_argument(
+        "--no_geo_monitor", dest="geo_monitor", action="store_false",
+        help="Turn off --geo_monitor set by a config.",
+    )
+    p.add_argument(
         "--geo_monitor_sharded",
         action="store_true",
         default=True,
@@ -2466,6 +2593,33 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Tensor parallelism degree (1 = DDP only, 8 = full TP on 8 GPUs)",
+    )
+
+    # FSDP2 (kotodama.training.fsdp)
+    p.add_argument(
+        "--fsdp2", action="store_true",
+        help="Shard parameters, gradients and optimizer state with FSDP2 (fully_shard) instead of DDP: fp32 sharded "
+             "parameters (the optimizer masters) computed in bf16, gradients reduced in fp32, Muon orthogonalizing "
+             "each matrix on one owner rank. Checkpoints become step_*.dcp directories.",
+    )
+    p.add_argument(
+        "--fsdp2_replicas", type=int, default=1,
+        help="With --fsdp2: HSDP with this many replicas (each a world_size/replicas-way shard). 1 = plain FSDP.",
+    )
+    p.add_argument(
+        "--fsdp2_reshard_after_forward", action="store_true", default=True,
+        help="(default on) With --fsdp2: free each unit's gathered weights after its forward and gather them again "
+             "for backward (ZeRO-3). Off keeps them gathered from forward to backward (ZeRO-2: more memory, less "
+             "communication).",
+    )
+    p.add_argument(
+        "--no_fsdp2_reshard_after_forward", dest="fsdp2_reshard_after_forward", action="store_false",
+        help="Turn off --fsdp2_reshard_after_forward.",
+    )
+    p.add_argument(
+        "--rank_data_guard_steps", type=int, default=20,
+        help="For the first N steps of every launch, check that every data-parallel rank trains on a different "
+             "micro-batch (one tiny all-gather per micro-step; a repeat raises). 0 disables.",
     )
 
     # torch.compile
