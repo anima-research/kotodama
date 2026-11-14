@@ -718,8 +718,9 @@ def train(args: argparse.Namespace) -> None:
                     "selective recompute; manual AC off)", ac_budget)
         if getattr(args, "compile_regional", False):
             if is_main:
-                logger.info("Regional compile: per-layer attn/MLP sublayers (mode=%s)...", compile_mode)
-            model.compile_regions(mode=compile_mode)
+                logger.info("Regional compile: per-%s regions (mode=%s)...",
+                            getattr(args, "compile_regional_scope", "sublayer"), compile_mode)
+            model.compile_regions(scope=getattr(args, "compile_regional_scope", "sublayer"), mode=compile_mode)
         else:
             if is_main:
                 logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
@@ -2502,6 +2503,12 @@ def parse_args() -> argparse.Namespace:
         help="With --compile: compile each layer's attention / MLP sublayer (one compiled function shared by "
              "every layer, KotodamaModel.compile_regions) instead of the whole model — a few small graphs "
              "instead of the unrolled depth; AttnRes models only.",
+    )
+    p.add_argument(
+        "--compile_regional_scope", choices=["sublayer", "layer"], default="sublayer",
+        help="With --compile_regional: 'sublayer' compiles attention / MLP sublayers with the AttnRes routes eager "
+             "between them; 'layer' compiles each whole layer with both routes (one graph per committed-block count "
+             "and boundary).",
     )
     p.add_argument(
         "--attnres_eps_fp64_compat", action="store_true",

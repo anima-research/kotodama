@@ -162,6 +162,8 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--chain", action="store_true", help="--attnres_stack_grad_chain")
     ap.add_argument("--eager", action="store_true", help="no torch.compile (debugging)")
+    ap.add_argument("--compile_scope", choices=["whole", "sublayer", "layer"], default="whole",
+                    help="whole-model torch.compile, or KotodamaModel.compile_regions at that scope (AttnRes only)")
     ap.add_argument("--flce", action="store_true",
                     help="loss via the model's fused linear CE inside the compiled graph (as in training). Default: "
                          "the compiled model returns logits and the CE runs eagerly — under a single unsplit compiled "
@@ -184,7 +186,13 @@ def main() -> int:
     torch.manual_seed(0)
     model = KotodamaModel(cfg).to(device=DEVICE, dtype=torch.bfloat16)
     model.train()
-    compiled = model if a.eager else torch.compile(model)
+    if a.eager:
+        compiled = model
+    elif a.compile_scope == "whole":
+        compiled = torch.compile(model)
+    else:
+        model.compile_regions(scope=a.compile_scope)
+        compiled = model
     B, T = a.mb, a.seq
     g = torch.Generator(device=DEVICE).manual_seed(0)
     ids = torch.randint(0, cfg.vocab_size, (B, T), device=DEVICE, generator=g)
@@ -228,7 +236,7 @@ def main() -> int:
         "tag": a.tag, "hidden": a.hidden, "heads": a.heads, "kv": a.kv, "ffn": a.ffn, "eff_layers": cfg.num_layers,
         "unique_layers": cfg.num_unique_layers, "n_blocks": a.n_blocks,
         "loop": [a.loop_start, a.loop_len, a.loop_times],
-        "chain": a.chain, "flce": a.flce, "mb": B, "seq": T, "params": sum(p.numel() for p in model.parameters()),
+        "chain": a.chain, "flce": a.flce, "compile_scope": "eager" if a.eager else a.compile_scope, "mb": B, "seq": T, "params": sum(p.numel() for p in model.parameters()),
         "fwd_bwd_ms": ms, "us_per_token": ms * 1e3 / (B * T), "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
         "compile_s": compile_s, **extra,
     }), flush=True)

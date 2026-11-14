@@ -25,7 +25,7 @@ import math
 import os
 import types
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -124,6 +124,7 @@ def _init_fa4() -> bool:
 
 
 ATTN_RES_GAIN_MODES = ("learned", "frozen", "folded")
+COMPILE_REGION_SCOPES = ("sublayer", "layer")
 
 
 class UnitRoutingQuery(nn.Module):
@@ -942,6 +943,31 @@ class TransformerBlock(nn.Module):
     def mlp_sublayer(self, h: torch.Tensor, partial: torch.Tensor) -> torch.Tensor:
         return partial + self.ffn(self.ffn_norm(h))
 
+    def routed_layer(
+        self,
+        committed_stack: torch.Tensor,
+        partial: torch.Tensor,
+        h_attn: Optional[torch.Tensor],
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        block_mask=None,
+    ) -> torch.Tensor:
+        """One AttnRes layer with its routing: the pre-attention route over ``committed_stack`` (or ``h_attn`` as
+        given: a boundary layer routes before its block commits), the attention sublayer, the pre-MLP route and the
+        MLP sublayer. Same ops as the per-sublayer path; the unit ``compile_regions(scope="layer")`` compiles, one
+        graph per (committed-block count, boundary)."""
+        n = committed_stack.shape[0]
+        if h_attn is None:
+            h_attn, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.attn_res_query, self.attn_res_norm)
+        partial = TransformerBlock.attn_sublayer(
+            self, h_attn, partial, rope_cos, rope_sin, mask, position_ids, cu_seqlens, max_seqlen, block_mask)
+        h_mlp, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.mlp_res_query, self.mlp_res_norm)
+        return TransformerBlock.mlp_sublayer(self, h_mlp, partial)
+
 
 class KotodamaModel(nn.Module):
     """
@@ -1105,17 +1131,42 @@ class KotodamaModel(nn.Module):
             return self.lm_head.weight
         return self.embed_tokens.weight
 
-    def compile_regions(self, **compile_kwargs: Any) -> None:
-        """Regional compile: torch.compile each layer's attn_sublayer / mlp_sublayer in place of the whole model.
+    def compile_regions(self, scope: str = "sublayer", **compile_kwargs: Any) -> None:
+        """Regional compile: torch.compile per layer piece in place of the whole model.
 
-        One compiled function per sublayer kind is bound to every layer, so dynamo traces each once (parameters are
-        graph inputs) and every effective position — looped repeats included — reuses it; routing, embedding and
-        the loss head run eagerly between regions. Same math as whole-model compile up to fusion boundaries.
-        Train mode only: in eval mode the sublayers run eagerly, as eval forwards on the unwrapped module do under
-        whole-model compile (in-loop evals, monitors). AttnRes path only (the non-AttnRes path calls
-        TransformerBlock.forward)."""
+        ``scope="sublayer"``: each layer's attn_sublayer / mlp_sublayer. One compiled function per sublayer kind is
+        bound to every layer, so dynamo traces each once (parameters are graph inputs) and every effective position —
+        looped repeats included — reuses it; routing, embedding and the loss head run eagerly between regions.
+        ``scope="layer"``: TransformerBlock.routed_layer, the whole layer with both of its routes, so per layer one
+        region runs instead of two regions and two eager routes. The committed stack's depth differs per block, so
+        each (committed-block count, boundary) pair gets its own compiled copy of the function (a separate code
+        object, hence its own dynamo cache): at most 2 x n_blocks graphs, whatever the depth. Not with the batched
+        Phase 1 or the stack-gradient chain (those keep the per-sublayer routing).
+        Same math as whole-model compile up to fusion boundaries. Train mode only: in eval mode the layers run
+        eagerly, as eval forwards on the unwrapped module do under whole-model compile (in-loop evals, monitors).
+        AttnRes path only (the non-AttnRes path calls TransformerBlock.forward)."""
         if not self.config.attn_res:
             raise ValueError("compile_regions covers the AttnRes forward only; use torch.compile(model)")
+        if scope not in COMPILE_REGION_SCOPES:
+            raise ValueError(f"compile_regions scope={scope!r}; expected one of {COMPILE_REGION_SCOPES}")
+        if scope == "layer":
+            if _BATCH_PHASE1 or _STACK_GRAD_CHAIN:
+                raise ValueError("compile_regions(scope='layer') routes per sublayer: unset KOTODAMA_BATCH_P1 / "
+                                 "the stack-gradient chain, or use scope='sublayer'")
+            compiled: dict[tuple[int, bool], Callable] = {}
+
+            def layer_region(n_committed: int, boundary: bool) -> Callable:
+                key = (n_committed, boundary)
+                if key not in compiled:
+                    eager = TransformerBlock.routed_layer
+                    name = f"routed_layer_c{n_committed}{'_boundary' if boundary else ''}"
+                    clone = types.FunctionType(eager.__code__.replace(co_name=name, co_qualname=name),
+                                               eager.__globals__, name, eager.__defaults__, eager.__closure__)
+                    compiled[key] = torch.compile(clone, **compile_kwargs)
+                return compiled[key]
+
+            self._layer_region = layer_region
+            return
         eager_attn, eager_mlp = TransformerBlock.attn_sublayer, TransformerBlock.mlp_sublayer
         compiled_attn = torch.compile(eager_attn, **compile_kwargs)
         compiled_mlp = torch.compile(eager_mlp, **compile_kwargs)
@@ -1191,8 +1242,8 @@ class KotodamaModel(nn.Module):
         active_mask[:len(sources)] = True
         return self._route_static(buf, query, norm, active_mask)
 
+    @staticmethod
     def _route_p12(
-        self,
         committed_stack: Optional[torch.Tensor],
         n_committed: int,
         partial: torch.Tensor,
@@ -1362,8 +1413,20 @@ class KotodamaModel(nn.Module):
                 qi = 0
 
             # ── Process all layers in this block ──────────────────────
+            layer_region = getattr(self, "_layer_region", None) if self.training else None
             for i in range(block_start, block_end):
                 lyr = self.layers[i]
+
+                if layer_region is not None:
+                    # compile_regions(scope="layer"): the layer and both of its routes in one compiled region.
+                    region = layer_region(n_committed, i == block_start)
+                    args = (lyr, committed_stack, partial, h_attn if i == block_start else None, rope_cos, rope_sin,
+                            mask, position_ids, cu_seqlens, max_seqlen, block_mask)
+                    if use_ac:
+                        partial = torch_checkpoint(region, *args, use_reentrant=False, preserve_rng_state=False)
+                    else:
+                        partial = region(*args)
+                    continue
 
                 # Pre-attention routing (boundary layer already routed above)
                 if i != block_start:
