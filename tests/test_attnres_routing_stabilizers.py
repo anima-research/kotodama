@@ -14,11 +14,12 @@ from kotodama.training import train
 from kotodama.training.muon import HybridScheduler, build_hybrid_optimizer
 
 
-def _cfg(query_norm: bool = False, gain: str = "folded") -> KotodamaModelConfig:
+def _cfg(query_norm: bool = False, gain: str = "folded", temp_gain: float = 1.0) -> KotodamaModelConfig:
     return KotodamaModelConfig(
         hidden_size=64, num_layers=6, num_attention_heads=2, num_kv_heads=1, head_dim=32, intermediate_size=128,
         vocab_size=97, max_position_embeddings=32, attn_res=True, attn_res_boundaries=[0, 1, 3, 5],
         loop_start=1, loop_len=2, loop_times=2, attn_impl="sdpa", attn_res_gain=gain, attn_res_query_norm=query_norm,
+        attn_res_query_temp_gain=temp_gain,
     )
 
 
@@ -185,3 +186,17 @@ def test_flags_parse_and_default_off():
     assert a.attnres_query_norm is False and a.attnres_query_lr_scale == 1.0
     a = _args("--attnres_query_norm", "--attnres_res_gain", "folded", "--attnres_query_lr_scale", "0.25")
     assert a.attnres_query_norm is True and a.attnres_query_lr_scale == 0.25
+
+
+def test_temperature_gain_scales_the_effective_norm():
+    torch.manual_seed(0)
+    m = KotodamaModel(_cfg(True, temp_gain=8.0))
+    with torch.no_grad():
+        m.layers[2].parametrizations["attn_res_query"][0].temperature.fill_(0.5)
+    assert torch.allclose(m.layers[2].attn_res_query.norm(), torch.tensor(4.0))
+    assert all(t.shape == (1,) for t in m.routing_temperatures())
+
+
+def test_temperature_gain_flag():
+    assert _args().attnres_query_temp_gain == 1.0
+    assert _args("--attnres_query_temp_gain", "39.19").attnres_query_temp_gain == 39.19

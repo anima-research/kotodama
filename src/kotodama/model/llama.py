@@ -132,13 +132,16 @@ class UnitRoutingQuery(nn.Module):
     separate parameters (routing's analogue of QK-norm). The temperature starts at 0, so routing starts uniform, as a
     zero-init query does; the direction gets its gradient once the temperature moves off 0."""
 
-    def __init__(self) -> None:
+    def __init__(self, gain: float = 1.0) -> None:
         super().__init__()
         self.temperature = nn.Parameter(torch.zeros(1))  # 1-D: FSDP2 cannot shard a 0-dim parameter
+        # Constant multiplier on the temperature. AdamW moves a scalar by ~lr per step but a D-element query's norm by
+        # ~lr * sqrt(D); gain sqrt(D) makes the sharpness learn at a plain query's rate.
+        self.gain = float(gain)
 
     def forward(self, q: torch.Tensor) -> torch.Tensor:
         norm = q.float().norm().clamp_min(1e-12)
-        return (self.temperature.float() * q.float() / norm).to(q.dtype)
+        return (self.gain * self.temperature.float() * q.float() / norm).to(q.dtype)
 LIGER_RMSNORM_TUNED_SCOPES = ("all", "qk")
 
 
@@ -193,6 +196,9 @@ class KotodamaModelConfig:
     # direction. Fresh runs only (the parameter names differ from a plain query's); pair with attn_res_gain "folded"
     # or "frozen" so the gain cannot rescale the direction.
     attn_res_query_norm: bool = False
+    # UnitRoutingQuery's constant temperature gain (1.0: the temperature is the query norm; sqrt(hidden_size): its
+    # AdamW steps move the norm at a plain query's rate).
+    attn_res_query_temp_gain: float = 1.0
     # Looped depth: effective positions [loop_start, loop_start + loop_len*loop_times) reuse the attention
     # and FFN weights of the core [loop_start, loop_start + loop_len), run loop_times times. num_layers stays the
     # EFFECTIVE depth (AttnRes masks/boundaries, KV caches and capture all see one layer per position); each
@@ -1707,7 +1713,7 @@ class KotodamaModel(nn.Module):
                 d = torch.randn(q.shape, generator=gen, dtype=torch.float32)
                 q.copy_((d / d.norm()).to(q.dtype))
             frozen = not q.requires_grad
-            parametrize.register_parametrization(module, attr, UnitRoutingQuery())
+            parametrize.register_parametrization(module, attr, UnitRoutingQuery(self.config.attn_res_query_temp_gain))
             if frozen:
                 module.parametrizations[attr][0].temperature.requires_grad_(False)
 
