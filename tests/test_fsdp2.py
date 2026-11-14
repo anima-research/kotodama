@@ -409,6 +409,54 @@ def test_compiled_layers_match_eager_units(layers_per_group, ac, reshard, tmp_pa
     _spawn(_layer_compile_worker, 2, tmp_path, layers_per_group, ac, reshard)
 
 
+def _collective_count_worker(rank: int, world: int, init_file: str, reshard: bool, ac: bool) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_layers, compile_fsdp_sublayers
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    ref = _reference()
+    ref.config.activation_checkpointing = ac
+    counts: dict[str, list[int]] = {}
+    real_ag, real_rs = dist.all_gather_into_tensor, dist.reduce_scatter_tensor
+    tally = [0, 0]
+
+    def ag(*a, **k):
+        tally[0] += 1
+        return real_ag(*a, **k)
+
+    def rs(*a, **k):
+        tally[1] += 1
+        return real_rs(*a, **k)
+
+    dist.all_gather_into_tensor, dist.reduce_scatter_tensor = ag, rs
+    try:
+        for scope in ("unit", "sublayer", "layer"):
+            m = copy.deepcopy(ref)
+            params_to_fp32(m)
+            apply_fsdp2(m, mesh, param_dtype=None, layers_per_group=2, reshard_after_forward=reshard)
+            if scope == "sublayer":
+                compile_fsdp_sublayers(m, backend="eager")
+            elif scope == "layer":
+                compile_fsdp_layers(m, backend="eager")
+            tally[:] = [0, 0]
+            for step in range(2):
+                m(_batch(step, rank), labels=_batch(step, rank))["loss"].backward()
+            counts[scope] = list(tally)
+    finally:
+        dist.all_gather_into_tensor, dist.reduce_scatter_tensor = real_ag, real_rs
+    # every scope gathers and reduce-scatters each group once per pass, as the unit path's module hooks do
+    assert counts["sublayer"] == counts["unit"] and counts["layer"] == counts["unit"], counts
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("reshard,ac", [(True, False), (False, False), (True, True)],
+                         ids=["reshard", "zero2", "reshard-ac"])
+def test_compile_scopes_gather_as_often_as_units(reshard, ac, tmp_path):
+    _spawn(_collective_count_worker, 2, tmp_path, reshard, ac)
+
+
 def test_compiled_layers_need_layer_groups(tmp_path):
     _spawn(_layer_needs_groups_worker, 2, tmp_path)
 

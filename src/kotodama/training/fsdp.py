@@ -237,17 +237,38 @@ def _base_forward(unit: nn.Module) -> Any:
     return next(c for c in type(unit).__mro__ if "forward" in vars(c) and not c.__name__.startswith("FSDP")).forward
 
 
+def _group_call(unit: nn.Module, ran: tuple[nn.Module, ...], fn: Any, *args: Any) -> Any:
+    """Call ``fn(*args)`` as ``ran`` (modules of ``unit``'s shard group) running forward, with FSDP's group
+    pre-forward and post-forward where its own module hooks would put them: the pre-forward (gather; post-backward
+    registration on the inputs) when the first of the group's modules starts, the post-forward (reshard; pre-backward
+    hooks on the output) when the last one has run. This is the bookkeeping of ``fully_shard``'s hooks for a group of
+    modules (FSDPState._modules_to_run_forward), so a region that runs several of a group's modules, or a group whose
+    modules run inside other regions, gathers and reduces once per pass over the group, as the unit path does.
+    ``register_fsdp_forward_method`` instead runs both on every call, which re-gathers and reduce-scatters the whole
+    group once per call in backward."""
+    state = unit._get_fsdp_state()
+    to_run = state._modules_to_run_forward
+    kwargs: dict[str, Any] = {}
+    if not to_run:
+        to_run.update(state._modules)
+        args, kwargs = state._pre_forward(unit, args, kwargs)
+    out = fn(*args, **kwargs)
+    for m in ran:
+        to_run.discard(m)
+    if not to_run:
+        out = state._post_forward(unit, args, out)
+    return out
+
+
 def compile_fsdp_sublayers(model: nn.Module, **compile_kwargs: Any) -> int:
     """torch.compile each AttnRes sublayer whole, under FSDP2: the compiled region is the pre-norm, the attn / ffn
     unit's body and the residual add (the scope of :meth:`KotodamaModel.compile_regions`), and FSDP's gather /
-    reshard hooks run around it. Each unique attn / ffn unit gets a method ``kotodama_residual(norm, h, partial,
-    ...)`` registered as an FSDP forward method (``register_fsdp_forward_method``), and every layer's
+    reshard hooks run around it (:func:`_group_call`). Each unique attn / ffn unit gets a compiled
+    ``kotodama_residual(norm, h, partial, ...)``, and every layer's
     ``attn_sublayer`` / ``mlp_sublayer`` calls it; the unit's ``forward`` and ``__call__`` are not used on this path.
     One compiled function per sublayer kind and unit class, shared by every layer and loop repeat (parameters are
     graph inputs). The AttnRes routing between sublayers runs as before. Returns the number of compiled functions."""
     import types
-
-    from torch.distributed.fsdp import register_fsdp_forward_method
 
     compiled: dict[tuple[str, type], Any] = {}
 
@@ -277,17 +298,16 @@ def compile_fsdp_sublayers(model: nn.Module, **compile_kwargs: Any) -> int:
             if id(unit) not in done:
                 done.add(id(unit))
                 unit.kotodama_residual = types.MethodType(_compiled(kind, unit), unit)
-                register_fsdp_forward_method(unit, "kotodama_residual")
 
     def attn_sublayer(blk: nn.Module, h: torch.Tensor, partial: torch.Tensor, rope_cos: torch.Tensor,
                       rope_sin: torch.Tensor, mask: Optional[torch.Tensor] = None,
                       position_ids: Optional[torch.Tensor] = None, cu_seqlens: Optional[torch.Tensor] = None,
                       max_seqlen: Optional[int] = None, block_mask: Any = None) -> torch.Tensor:
-        return blk.attn.kotodama_residual(blk.attn_norm, h, partial, rope_cos, rope_sin, mask, position_ids,
-                                          cu_seqlens, max_seqlen, block_mask)
+        return _group_call(blk.attn, (blk.attn,), blk.attn.kotodama_residual, blk.attn_norm, h, partial, rope_cos,
+                           rope_sin, mask, position_ids, cu_seqlens, max_seqlen, block_mask)
 
     def mlp_sublayer(blk: nn.Module, h: torch.Tensor, partial: torch.Tensor) -> torch.Tensor:
-        return blk.ffn.kotodama_residual(blk.ffn_norm, h, partial)
+        return _group_call(blk.ffn, (blk.ffn,), blk.ffn.kotodama_residual, blk.ffn_norm, h, partial)
 
     for layer in model.layers:  # type: ignore[attr-defined]
         layer.attn_sublayer = types.MethodType(attn_sublayer, layer)
@@ -298,14 +318,11 @@ def compile_fsdp_sublayers(model: nn.Module, **compile_kwargs: Any) -> int:
 def compile_fsdp_layers(model: nn.Module, **compile_kwargs: Any) -> None:
     """torch.compile each whole AttnRes layer with both of its routes, under FSDP2: the regions of
     :meth:`KotodamaModel.compile_regions` ``(scope="layer")`` (one compiled copy of ``routed_layer`` per
-    committed-block count and boundary), each run through a method registered as an FSDP forward method on the
-    layer's attn unit. That unit's pre-forward gathers its shard group, which holds the layer's attn and ffn, so it
-    needs layer groups (``layers_per_group`` >= 1). Inside the region the units run through their class forwards
+    committed-block count and boundary), each run as the layer's attn and ffn running forward in their shard group
+    (:func:`_group_call`); the group must hold both, so it needs layer groups (``layers_per_group`` >= 1). Inside the region the units run through their class forwards
     (``attn_fn`` / ``ffn_fn``), so no FSDP hook fires inside a compiled graph. The layer's routing queries and norms
     belong to the root unit, gathered for the whole forward."""
     import types
-
-    from torch.distributed.fsdp import register_fsdp_forward_method
 
     for i, layer in enumerate(model.layers):  # type: ignore[attr-defined]
         if layer.attn._get_fsdp_state() is not layer.ffn._get_fsdp_state():
@@ -314,24 +331,21 @@ def compile_fsdp_layers(model: nn.Module, **compile_kwargs: Any) -> None:
     model.compile_regions(scope="layer", **compile_kwargs)  # type: ignore[attr-defined]
     regions = model._layer_region  # type: ignore[attr-defined]
 
-    def kotodama_layer(unit: nn.Module, region: Any, layer: nn.Module, *args: Any) -> torch.Tensor:
-        return region(layer, *args, attn_fn=unit._kotodama_body, ffn_fn=layer.ffn._kotodama_body)
-
     done: set[int] = set()
     for layer in model.layers:  # type: ignore[attr-defined]
         for unit in (layer.attn, layer.ffn):
             if id(unit) not in done:
                 done.add(id(unit))
                 unit._kotodama_body = types.MethodType(_base_forward(unit), unit)
-        if not hasattr(layer.attn, "kotodama_layer"):
-            layer.attn.kotodama_layer = types.MethodType(kotodama_layer, layer.attn)
-            register_fsdp_forward_method(layer.attn, "kotodama_layer")
 
     def fsdp_region(n_committed: int, boundary: bool) -> Any:
         region = regions(n_committed, boundary)
 
+        def body(layer: nn.Module, *args: Any) -> torch.Tensor:
+            return region(layer, *args, attn_fn=layer.attn._kotodama_body, ffn_fn=layer.ffn._kotodama_body)
+
         def run(layer: nn.Module, *args: Any) -> torch.Tensor:
-            return layer.attn.kotodama_layer(region, layer, *args)
+            return _group_call(layer.attn, (layer.attn, layer.ffn), body, layer, *args)
         return run
 
     model._layer_region = fsdp_region  # type: ignore[attr-defined]
