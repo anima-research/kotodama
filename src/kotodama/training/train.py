@@ -1082,11 +1082,16 @@ def train(args: argparse.Namespace) -> None:
     if use_fsdp2:
         if getattr(args, "async_checkpoint", False) and is_main:
             logger.warning("--async_checkpoint: FSDP2 saves are synchronous sharded (DCP) checkpoints")
+        _node_local = getattr(args, "fsdp2_node_local_checkpoints", False)
         ckpt_mgr = ShardedCheckpointManager(
             checkpoint_dir=args.checkpoint_dir,
             rank=rank,
             keep_last_n=args.keep_checkpoints,
+            group=fsdp_mesh["shard"].get_group() if _node_local and fsdp_mesh.ndim == 2 else None,
         )
+        if _node_local and is_main:
+            logger.info("Sharded checkpoints are node-local: each node saves a complete copy into %s on its own disk",
+                        args.checkpoint_dir)
     elif getattr(args, "async_checkpoint", False):
         ckpt_mgr = AsyncCheckpointManager(
             checkpoint_dir=args.checkpoint_dir,
@@ -2225,6 +2230,8 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
     if not getattr(args, "fsdp2", False):
         if getattr(args, "fsdp2_replicas", 1) != 1:
             raise ValueError("--fsdp2_replicas needs --fsdp2")
+        if getattr(args, "fsdp2_node_local_checkpoints", False):
+            raise ValueError("--fsdp2_node_local_checkpoints needs --fsdp2")
         return
     unsupported = {
         "--tp_size > 1": getattr(args, "tp_size", 1) > 1,
@@ -2758,6 +2765,12 @@ def parse_args() -> argparse.Namespace:
              "eager between units); 'sublayer' compiles each whole AttnRes sublayer (pre-norm + unit + residual) "
              "with the FSDP hooks around it; 'layer' compiles each whole layer with both AttnRes routes (needs "
              "--fsdp2_layers_per_group >= 1). AttnRes models only.",
+    )
+    p.add_argument(
+        "--fsdp2_node_local_checkpoints", action="store_true",
+        help="With --fsdp2 --fsdp2_replicas > 1: each node (replica) saves a complete sharded checkpoint into "
+             "--checkpoint_dir on its own disk (a node-local path, the same on every node), and resume reads each "
+             "node's own copy; without it the checkpoint dir must be one filesystem every rank sees.",
     )
     p.add_argument(
         "--fsdp2_defer_grad_sync", action="store_true",

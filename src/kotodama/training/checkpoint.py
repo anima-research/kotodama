@@ -769,9 +769,29 @@ class ShardedCheckpointManager(CheckpointManager):
     checkpoint directory must be one filesystem all ranks see) plus the :attr:`META` file (step, tokens, scheduler, data
     position and the run's extras, written by rank 0). A save goes to ``<name>.tmp`` and is renamed only once every
     rank has finished, so an interrupted save is never mistaken for a checkpoint. Resume reshards on load, so the
-    world size may change between save and resume."""
+    world size may change between save and resume.
+
+    Node-local checkpoints (``group`` = the HSDP shard group, the ranks of one replica): each replica saves a complete
+    copy of the model and optimizers over its own group into ``checkpoint_dir`` as its node sees it (a node-local path:
+    the same string on every node, a different disk). DCP's dedup of replicated shards then never crosses replicas, so
+    every node's directory alone restores the run; the group's first rank writes the META file and renames. Resume
+    loads the newest step present on every node, over each node's own directory. A node that did not save (e.g. a new
+    one after a world-size change) needs a copy of a checkpoint directory first."""
 
     META = "meta.pt"
+
+    def __init__(
+        self,
+        checkpoint_dir: str | Path,
+        rank: int = 0,
+        keep_last_n: int = 5,
+        group: Optional[Any] = None,
+    ) -> None:
+        self.group = group
+        self.leader = (dist.get_rank(group) == 0) if group is not None else rank == 0
+        super().__init__(checkpoint_dir, rank=rank, keep_last_n=keep_last_n)
+        if self.leader:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def save(
         self,
@@ -790,14 +810,14 @@ class ShardedCheckpointManager(CheckpointManager):
         require_finite_params(model, f"sharded checkpoint step {step}")
         path = self.checkpoint_dir / f"step_{step:08d}.dcp"
         tmp = path.with_name(path.name + ".tmp")
-        if self.rank == 0 and tmp.exists():
+        if self.leader and tmp.exists():
             shutil.rmtree(tmp)  # an earlier interrupted save of this very step
         _barrier()
         t0 = time.time()
         raw = _unwrap(model)
         msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
-        dcp.save({"model": msd, "optim": osd}, checkpoint_id=str(tmp))
-        if self.rank == 0:
+        dcp.save({"model": msd, "optim": osd}, checkpoint_id=str(tmp), process_group=self.group)
+        if self.leader:
             meta: dict[str, Any] = {
                 "step": step,
                 "tokens_consumed": tokens_consumed,
@@ -811,21 +831,31 @@ class ShardedCheckpointManager(CheckpointManager):
                 meta.update(extra)
             torch.save(meta, tmp / self.META)
         _barrier()
-        if self.rank == 0:
+        if self.leader:
             tmp.rename(path)
             logger.info("Sharded checkpoint saved: %s (%.1fs)", path, time.time() - t0)
             self._cleanup_old(keep=self.keep_last_n)
         _barrier()
-        return path if self.rank == 0 else None
+        return path if self.leader else None
 
     def save_blocking(self, **kwargs: Any) -> Optional[Path]:
         return self.save(**kwargs)
 
     def latest(self) -> Optional[Path]:
-        """The newest complete ``step_*.dcp`` directory, or None."""
+        """The newest complete ``step_*.dcp`` directory, or None. Node-local: the newest step complete on every node
+        (collective; a crash between two nodes' renames leaves them a step apart)."""
         found = sorted(d for d in self.checkpoint_dir.glob("step_*.dcp")
                        if _DCP_NAME.match(d.name) and (d / self.META).exists())
-        return found[-1] if found else None
+        if self.group is None or not dist.is_initialized():
+            return found[-1] if found else None
+        mine = {d.name for d in found}
+        everyone: list[Any] = [None] * dist.get_world_size()
+        dist.all_gather_object(everyone, sorted(mine))
+        common = set(mine).intersection(*[set(e) for e in everyone])
+        if common != mine and found:
+            logger.warning("Node-local checkpoints differ across nodes; resuming from the newest common one (%s)",
+                           max(common) if common else "none")
+        return self.checkpoint_dir / max(common) if common else None
 
     def load_latest(
         self,
@@ -849,7 +879,7 @@ class ShardedCheckpointManager(CheckpointManager):
         raw = _unwrap(model)
         msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
         state = {"model": msd, "optim": osd}
-        dcp.load(state, checkpoint_id=str(latest))
+        dcp.load(state, checkpoint_id=str(latest), process_group=self.group)
         set_state_dict(raw, [muon_opt, adamw_opt], model_state_dict=state["model"], optim_state_dict=state["optim"])
         meta = torch.load(latest / self.META, map_location="cpu", weights_only=False)
         ns = meta.get("ns_coefficients")

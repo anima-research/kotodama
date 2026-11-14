@@ -625,6 +625,71 @@ def test_sharded_checkpoint_resumes_bitwise(tmp_path):
     _spawn(_ckpt_worker, 2, tmp_path / "c", str(ckpt), str(out), "resume-other-world")
 
 
+def _node_local_worker(rank: int, world: int, init_file: str, base: str, out_dir: str, phase: str) -> None:
+    from kotodama.training.checkpoint import ShardedCheckpointManager
+    from kotodama.training.fsdp import build_mesh
+
+    _init(rank, world, init_file)
+    replicas = 2 if world == 4 else 1
+    mesh = build_mesh(world, replicas, device_type="cpu")
+    model = _sharded(_reference(), mesh)
+    muon, adamw = _optimizers(model)
+    sched = HybridScheduler(muon, adamw, warmup_steps=2, total_steps=20, decay_start_pct=0.5)
+    node = rank // (world // replicas)
+    shard_group = mesh["shard"].get_group() if replicas > 1 else None
+    mgr = ShardedCheckpointManager(Path(base) / f"node{node}", rank=rank, keep_last_n=3, group=shard_group)
+    if phase == "save":
+        _train_steps(model, muon, adamw, sched, rank, 0, 3)
+        mgr.save(step=2, model=model, muon_opt=muon, adamw_opt=adamw, scheduler=sched, tokens_consumed=11)
+        saved2 = full_model_state_dict(model)
+        _train_steps(model, muon, adamw, sched, rank, 3, 2)
+        mgr.save(step=4, model=model, muon_opt=muon, adamw_opt=adamw, scheduler=sched, tokens_consumed=22)
+        saved4 = full_model_state_dict(model)
+        _train_steps(model, muon, adamw, sched, rank, 5, 2)
+        final = full_model_state_dict(model)
+        if rank == 0:
+            torch.save({"saved2": saved2, "saved4": saved4, "final": final}, Path(out_dir) / "run.pt")
+    else:
+        meta = mgr.load_latest(model, muon, adamw, torch.device("cpu"))
+        want = torch.load(Path(out_dir) / "run.pt")
+        step = {"resume-each-node": 4, "resume-one-node": 4, "resume-common-step": 2}[phase]
+        assert meta["step"] == step, (phase, meta["step"])
+        loaded = full_model_state_dict(model)
+        if rank == 0:
+            for k, v in want[f"saved{step}"].items():
+                assert torch.equal(loaded[k], v), (phase, k)
+        if phase == "resume-each-node":  # the resumed run reproduces the uninterrupted one exactly
+            _train_steps(model, muon, adamw, sched, rank, 5, 2)
+            final = full_model_state_dict(model)
+            if rank == 0:
+                for k, v in want["final"].items():
+                    assert torch.equal(final[k], v), ("resume", k)
+    dist.destroy_process_group()
+
+
+def test_node_local_checkpoints(tmp_path):
+    """HSDP, 2 replicas x 2 ranks, each replica ("node") saving into its own directory: every node's directory is a
+    complete checkpoint (DCP's dedup of replicated shards stays inside a node)."""
+    import shutil
+
+    base, out = tmp_path / "ckpt", tmp_path / "out"
+    out.mkdir()
+    for d in "abcd":
+        (tmp_path / d).mkdir()
+    _spawn(_node_local_worker, 4, tmp_path / "a", str(base), str(out), "save")
+    for node in ("node0", "node1"):
+        assert (base / node / "step_00000004.dcp" / "meta.pt").is_file(), node
+        assert (base / node / "step_00000004.dcp" / ".metadata").is_file(), node
+    _spawn(_node_local_worker, 4, tmp_path / "b", str(base), str(out), "resume-each-node")
+    # one node's directory alone restores the run, here at world 2 (one replica)
+    shutil.rmtree(base / "node1")
+    _spawn(_node_local_worker, 2, tmp_path / "c", str(base), str(out), "resume-one-node")
+    # nodes a step apart (a crash between their renames): both resume from the newest step they share
+    shutil.copytree(base / "node0", base / "node1")
+    shutil.rmtree(base / "node1" / "step_00000004.dcp")
+    _spawn(_node_local_worker, 4, tmp_path / "d", str(base), str(out), "resume-common-step")
+
+
 def test_sharded_manager_refuses_unsharded_checkpoints(tmp_path):
     from kotodama.training.checkpoint import ShardedCheckpointManager
 
@@ -716,3 +781,5 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):
         validate_fsdp2_args(argparse.Namespace(fsdp2=False, fsdp2_replicas=2))
+    with pytest.raises(ValueError, match="needs --fsdp2"):
+        validate_fsdp2_args(argparse.Namespace(fsdp2=False, fsdp2_replicas=1, fsdp2_node_local_checkpoints=True))
