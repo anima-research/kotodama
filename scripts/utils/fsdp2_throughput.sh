@@ -9,7 +9,8 @@
 # available: fsdp2-zero2, fsdp2-defer (reduce-scatter deferred to a step's last micro-step), fsdp2-mb16.
 # Under a multi-node launch (the scheduler sets NNODES > 1) every fsdp2 run is HSDP, sharded within a node and
 # replicated across nodes (--fsdp2_replicas NNODES), except the -flat runs (fsdp2-layer-flat, fsdp2-layer-flat-mxfp8),
-# which shard one layer per group over every rank of every node. Interconnect settings (e.g. NCCL_IB_HCA) come from the environment.
+# which shard one layer per group over every rank of every node. Interconnect settings (e.g. NCCL_IB_HCA) come
+# from the environment.
 # Each run's log is OUT/<name>/train.log and its GPU power / SM clock / throttle reasons, sampled every 5 s, are
 # OUT/<name>/power.csv, for the job's own GPUs (node k: train.node<k>.log, power.node<k>.csv). The summary (over the
 # second half of the steps: mean tok/s, MFU, optimizer share, peak memory, mean power and clock, and the share of
