@@ -8,8 +8,8 @@
 # whose torchao carries the CUDA mxfp8 kernels; skipped if absent). Also
 # available: fsdp2-zero2, fsdp2-defer (reduce-scatter deferred to a step's last micro-step), fsdp2-mb16.
 # Under a multi-node launch (the scheduler sets NNODES > 1) every fsdp2 run is HSDP, sharded within a node and
-# replicated across nodes (--fsdp2_replicas NNODES), except fsdp2-layer-flat, which shards one layer per group over
-# every rank of every node. Interconnect settings (e.g. NCCL_IB_HCA) come from the environment.
+# replicated across nodes (--fsdp2_replicas NNODES), except the -flat runs (fsdp2-layer-flat, fsdp2-layer-flat-mxfp8),
+# which shard one layer per group over every rank of every node. Interconnect settings (e.g. NCCL_IB_HCA) come from the environment.
 # Each run's log is OUT/<name>/train.log and its GPU power / SM clock / throttle reasons, sampled every 5 s, are
 # OUT/<name>/power.csv, for the job's own GPUs (node k: train.node<k>.log, power.node<k>.csv). The summary (over the
 # second half of the steps: mean tok/s, MFU, optimizer share, peak memory, mean power and clock, and the share of
@@ -56,11 +56,12 @@ for name in "${LIST[@]}"; do
                                      --attnres_stack_grad_chain --liger_rmsnorm_tuned) ;;
     fsdp2-mb16) EXTRA=(--fsdp2 --micro_batch_size 16) ;;
     fsdp2-layer-flat) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8) ;;
+    fsdp2-layer-flat-mxfp8) EXTRA=(--fsdp2 --fsdp2_layers_per_group 1 --micro_batch_size 8 --fp8 --fp8_recipe mxfp8) ;;
     fsdp2-group2) EXTRA=(--fsdp2 --fsdp2_layers_per_group 2 --micro_batch_size 8) ;;
     fsdp2-group4) EXTRA=(--fsdp2 --fsdp2_layers_per_group 4 --micro_batch_size 8) ;;
     *) echo "unknown run $name" >&2; exit 2 ;;
   esac
-  if [[ "$name" == fsdp2* && "$name" != *-flat ]]; then EXTRA+=("${REPL[@]}"); fi
+  if [[ "$name" == fsdp2* && "$name" != *-flat* ]]; then EXTRA+=("${REPL[@]}"); fi
   # A fresh rendezvous port per run, so a run never meets the previous one's socket still closing.
   PORT_OFF=$((PORT_OFF + 1)); export MASTER_PORT=$((BASE_PORT + PORT_OFF))
   RUN_VENV="${KOTODAMA_VENV:-}"
