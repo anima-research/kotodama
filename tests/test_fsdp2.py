@@ -368,6 +368,63 @@ def test_compiled_sublayers_match_eager_units(layers_per_group, ac, tmp_path):
     _spawn(_sublayer_compile_worker, 2, tmp_path, layers_per_group, ac)
 
 
+def _layer_compile_worker(rank: int, world: int, init_file: str, layers_per_group: int, ac: bool,
+                          reshard: bool) -> None:
+    from torch._dynamo.utils import counters
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_layers
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    ref = _reference()
+    ref.config.activation_checkpointing = ac
+    models = []
+    for _ in range(2):
+        m = copy.deepcopy(ref)
+        params_to_fp32(m)
+        apply_fsdp2(m, mesh, param_dtype=None, layers_per_group=layers_per_group, reshard_after_forward=reshard)
+        models.append(m)
+    plain, compiled = models
+    counters.clear()
+    compile_fsdp_layers(compiled, backend="eager")
+    for step in range(2):
+        for m in (plain, compiled):
+            m(_batch(step, rank), labels=_batch(step, rank))["loss"].backward()
+        for (name, p), q in zip(plain.named_parameters(), compiled.parameters()):
+            assert (p.grad is None) == (q.grad is None), name
+            if p.grad is not None:
+                # the layer region routes and sums in its own order: fp32 rounding, not bitwise
+                assert _rel(_full(q.grad), _full(p.grad)) < 1e-5, (step, name)
+        for m in (plain, compiled):
+            m.zero_grad(set_to_none=True)
+    # one graph per (committed-block count, boundary), not one per layer: <= 2 x n_blocks frames in all
+    assert 1 <= counters["stats"]["unique_graphs"] <= 2 * len(_cfg().attn_res_boundaries), dict(counters["stats"])
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("layers_per_group,ac,reshard", [(1, False, True), (2, False, False), (2, True, True)],
+                         ids=["groups-of-1", "groups-of-2-zero2", "groups-of-2-ac"])
+def test_compiled_layers_match_eager_units(layers_per_group, ac, reshard, tmp_path):
+    _spawn(_layer_compile_worker, 2, tmp_path, layers_per_group, ac, reshard)
+
+
+def test_compiled_layers_need_layer_groups(tmp_path):
+    _spawn(_layer_needs_groups_worker, 2, tmp_path)
+
+
+def _layer_needs_groups_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_layers
+
+    _init(rank, world, init_file)
+    model = _sharded(_reference(), init_device_mesh("cpu", (world,)))  # one unit per attn / ffn module
+    with pytest.raises(ValueError, match="separate FSDP units"):
+        compile_fsdp_layers(model, backend="eager")
+    dist.destroy_process_group()
+
+
 # ── in-loop evals: uneven forward counts in lockstep ─────────────────────────
 
 

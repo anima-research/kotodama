@@ -814,7 +814,14 @@ def train(args: argparse.Namespace) -> None:
                 logger.info(
                     "Inductor activation_memory_budget=%.2f (partitioner-driven "
                     "selective recompute; manual AC off)", ac_budget)
-        if use_fsdp2 and getattr(args, "fsdp2_compile_scope", "unit") == "sublayer":
+        if use_fsdp2 and getattr(args, "fsdp2_compile_scope", "unit") == "layer":
+            from kotodama.training.fsdp import compile_fsdp_layers
+
+            compile_fsdp_layers(model, mode=compile_mode)
+            if is_main:
+                logger.info("FSDP2 compile: whole AttnRes layers with both routes (one graph per committed-block "
+                            "count and boundary; gather hooks around them; mode=%s)", compile_mode)
+        elif use_fsdp2 and getattr(args, "fsdp2_compile_scope", "unit") == "sublayer":
             from kotodama.training.fsdp import compile_fsdp_sublayers
 
             _n_cls = compile_fsdp_sublayers(model, mode=compile_mode)
@@ -2232,8 +2239,12 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         raise ValueError("--fsdp2 does not support: " + "; ".join(bad))
     if getattr(args, "fsdp2_replicas", 1) < 1:
         raise ValueError("--fsdp2_replicas must be >= 1")
-    if getattr(args, "fsdp2_compile_scope", "unit") == "sublayer" and not getattr(args, "attn_res", True):
-        raise ValueError("--fsdp2_compile_scope sublayer compiles the AttnRes sublayers; it needs --attn_res")
+    scope = getattr(args, "fsdp2_compile_scope", "unit")
+    if scope != "unit" and not getattr(args, "attn_res", True):
+        raise ValueError(f"--fsdp2_compile_scope {scope} compiles AttnRes regions; it needs --attn_res")
+    if scope == "layer" and getattr(args, "fsdp2_layers_per_group", 0) < 1:
+        raise ValueError("--fsdp2_compile_scope layer gathers a layer's attn and ffn together; it needs "
+                         "--fsdp2_layers_per_group >= 1")
 
 
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
@@ -2742,10 +2753,11 @@ def parse_args() -> argparse.Namespace:
              "all-reduce.",
     )
     p.add_argument(
-        "--fsdp2_compile_scope", choices=("unit", "sublayer"), default="unit",
+        "--fsdp2_compile_scope", choices=("unit", "sublayer", "layer"), default="unit",
         help="With --fsdp2 --compile: 'unit' compiles each attn / ffn unit's forward (pre-norms and residual adds "
              "eager between units); 'sublayer' compiles each whole AttnRes sublayer (pre-norm + unit + residual) "
-             "with the FSDP hooks around it (needs AttnRes).",
+             "with the FSDP hooks around it; 'layer' compiles each whole layer with both AttnRes routes (needs "
+             "--fsdp2_layers_per_group >= 1). AttnRes models only.",
     )
     p.add_argument(
         "--fsdp2_defer_grad_sync", action="store_true",

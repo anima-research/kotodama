@@ -295,6 +295,48 @@ def compile_fsdp_sublayers(model: nn.Module, **compile_kwargs: Any) -> int:
     return len(compiled)
 
 
+def compile_fsdp_layers(model: nn.Module, **compile_kwargs: Any) -> None:
+    """torch.compile each whole AttnRes layer with both of its routes, under FSDP2: the regions of
+    :meth:`KotodamaModel.compile_regions` ``(scope="layer")`` (one compiled copy of ``routed_layer`` per
+    committed-block count and boundary), each run through a method registered as an FSDP forward method on the
+    layer's attn unit. That unit's pre-forward gathers its shard group, which holds the layer's attn and ffn, so it
+    needs layer groups (``layers_per_group`` >= 1). Inside the region the units run through their class forwards
+    (``attn_fn`` / ``ffn_fn``), so no FSDP hook fires inside a compiled graph. The layer's routing queries and norms
+    belong to the root unit, gathered for the whole forward."""
+    import types
+
+    from torch.distributed.fsdp import register_fsdp_forward_method
+
+    for i, layer in enumerate(model.layers):  # type: ignore[attr-defined]
+        if layer.attn._get_fsdp_state() is not layer.ffn._get_fsdp_state():
+            raise ValueError(f"compile_fsdp_layers: layer {i}'s attn and ffn are separate FSDP units; shard by layer "
+                             "groups (--fsdp2_layers_per_group >= 1)")
+    model.compile_regions(scope="layer", **compile_kwargs)  # type: ignore[attr-defined]
+    regions = model._layer_region  # type: ignore[attr-defined]
+
+    def kotodama_layer(unit: nn.Module, region: Any, layer: nn.Module, *args: Any) -> torch.Tensor:
+        return region(layer, *args, attn_fn=unit._kotodama_body, ffn_fn=layer.ffn._kotodama_body)
+
+    done: set[int] = set()
+    for layer in model.layers:  # type: ignore[attr-defined]
+        for unit in (layer.attn, layer.ffn):
+            if id(unit) not in done:
+                done.add(id(unit))
+                unit._kotodama_body = types.MethodType(_base_forward(unit), unit)
+        if not hasattr(layer.attn, "kotodama_layer"):
+            layer.attn.kotodama_layer = types.MethodType(kotodama_layer, layer.attn)
+            register_fsdp_forward_method(layer.attn, "kotodama_layer")
+
+    def fsdp_region(n_committed: int, boundary: bool) -> Any:
+        region = regions(n_committed, boundary)
+
+        def run(layer: nn.Module, *args: Any) -> torch.Tensor:
+            return layer.attn.kotodama_layer(region, layer, *args)
+        return run
+
+    model._layer_region = fsdp_region  # type: ignore[attr-defined]
+
+
 def is_fsdp2(model: nn.Module) -> bool:
     """True when ``model`` (or the module it wraps) has been through :func:`apply_fsdp2`."""
     from torch.distributed.fsdp import FSDPModule
