@@ -96,3 +96,18 @@ def test_bad_scope_refuses() -> None:
     cfg = KotodamaModelConfig(**BASE, **SHAPES["plain-7"])
     with pytest.raises(ValueError, match="scope"):
         KotodamaModel(cfg).compile_regions(scope="block", backend="aot_eager")
+
+
+def test_routed_layer_takes_unit_bodies() -> None:
+    """attn_fn / ffn_fn as the class forwards bound to the modules (how an FSDP2 wrapper skips the hooks) give the
+    same layer output as the modules themselves."""
+    torch.manual_seed(3)
+    m = KotodamaModel(KotodamaModelConfig(**BASE, **SHAPES["plain-7"])).train()
+    lyr = m.layers[3]
+    stack = torch.randn(2, 2, 24, 64)
+    partial = torch.randn(2, 24, 64)
+    cos, sin = m.rope_cos, m.rope_sin
+    ref = lyr.routed_layer(stack, partial, None, cos, sin)
+    out = lyr.routed_layer(stack, partial, None, cos, sin,
+                           attn_fn=type(lyr.attn).forward.__get__(lyr.attn), ffn_fn=type(lyr.ffn).forward.__get__(lyr.ffn))
+    assert torch.equal(ref, out)

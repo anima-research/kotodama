@@ -955,18 +955,27 @@ class TransformerBlock(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         block_mask=None,
+        attn_fn: Optional[Callable[..., torch.Tensor]] = None,
+        ffn_fn: Optional[Callable[..., torch.Tensor]] = None,
     ) -> torch.Tensor:
         """One AttnRes layer with its routing: the pre-attention route over ``committed_stack`` (or ``h_attn`` as
         given: a boundary layer routes before its block commits), the attention sublayer, the pre-MLP route and the
         MLP sublayer. Same ops as the per-sublayer path; the unit ``compile_regions(scope="layer")`` compiles, one
-        graph per (committed-block count, boundary)."""
+        graph per (committed-block count, boundary).
+
+        ``attn_fn`` / ``ffn_fn`` replace ``self.attn`` / ``self.ffn`` as the callables applied to the normed input
+        (same signatures). A wrapper that must not run the modules' ``__call__`` inside a compiled region (FSDP2's
+        hooks on a unit that holds attn + ffn) passes their class forwards bound to the modules."""
+        attn_fn = self.attn if attn_fn is None else attn_fn
+        ffn_fn = self.ffn if ffn_fn is None else ffn_fn
         n = committed_stack.shape[0]
         if h_attn is None:
             h_attn, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.attn_res_query, self.attn_res_norm)
-        partial = TransformerBlock.attn_sublayer(
-            self, h_attn, partial, rope_cos, rope_sin, mask, position_ids, cu_seqlens, max_seqlen, block_mask)
+        partial = partial + attn_fn(
+            self.attn_norm(h_attn), rope_cos, rope_sin, mask,
+            position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, block_mask=block_mask)
         h_mlp, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.mlp_res_query, self.mlp_res_norm)
-        return TransformerBlock.mlp_sublayer(self, h_mlp, partial)
+        return partial + ffn_fn(self.ffn_norm(h_mlp))
 
 
 class KotodamaModel(nn.Module):
