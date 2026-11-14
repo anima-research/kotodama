@@ -814,7 +814,15 @@ def train(args: argparse.Namespace) -> None:
                 logger.info(
                     "Inductor activation_memory_budget=%.2f (partitioner-driven "
                     "selective recompute; manual AC off)", ac_budget)
-        if use_fsdp2:
+        if use_fsdp2 and getattr(args, "fsdp2_compile_scope", "unit") == "sublayer":
+            from kotodama.training.fsdp import compile_fsdp_sublayers
+
+            _n_cls = compile_fsdp_sublayers(model, mode=compile_mode)
+            if is_main:
+                logger.info("FSDP2 compile: whole AttnRes sublayers (%d compiled functions: pre-norm + unit + "
+                            "residual; gather hooks around them, routing eager between them; mode=%s)",
+                            _n_cls, compile_mode)
+        elif use_fsdp2:
             from kotodama.training.fsdp import compile_fsdp_units
 
             _n_cls = compile_fsdp_units(_units, mode=compile_mode)
@@ -2223,6 +2231,8 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         raise ValueError("--fsdp2 does not support: " + "; ".join(bad))
     if getattr(args, "fsdp2_replicas", 1) < 1:
         raise ValueError("--fsdp2_replicas must be >= 1")
+    if getattr(args, "fsdp2_compile_scope", "unit") == "sublayer" and not getattr(args, "attn_res", True):
+        raise ValueError("--fsdp2_compile_scope sublayer compiles the AttnRes sublayers; it needs --attn_res")
 
 
 def ddp_options(args: argparse.Namespace, find_unused: bool) -> dict[str, Any]:
@@ -2729,6 +2739,12 @@ def parse_args() -> argparse.Namespace:
         help="With --fsdp2: the dtype gradients are reduce-scattered (and their shards accumulated) in. fp32 "
              "(default) is exact to the fp32 sum; bf16 halves the gradient traffic and rounds like DDP's bf16 "
              "all-reduce.",
+    )
+    p.add_argument(
+        "--fsdp2_compile_scope", choices=("unit", "sublayer"), default="unit",
+        help="With --fsdp2 --compile: 'unit' compiles each attn / ffn unit's forward (pre-norms and residual adds "
+             "eager between units); 'sublayer' compiles each whole AttnRes sublayer (pre-norm + unit + residual) "
+             "with the FSDP hooks around it (needs AttnRes).",
     )
     p.add_argument(
         "--fsdp2_defer_grad_sync", action="store_true",

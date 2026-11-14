@@ -325,6 +325,49 @@ def test_compiled_units_match_eager_units(tmp_path):
     _spawn(_compile_worker, 2, tmp_path)
 
 
+def _sublayer_compile_worker(rank: int, world: int, init_file: str, layers_per_group: int, ac: bool) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_sublayers
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    ref = _reference()
+    ref.config.activation_checkpointing = ac
+    models = []
+    for _ in range(2):
+        m = copy.deepcopy(ref)
+        params_to_fp32(m)
+        apply_fsdp2(m, mesh, param_dtype=None, layers_per_group=layers_per_group)
+        models.append(m)
+    plain, compiled = models
+    # one function per sublayer kind and unit class, shared by every layer and loop repeat
+    assert compile_fsdp_sublayers(compiled, backend="eager") == 2
+    assert compiled.layers[3].attn is compiled.layers[1].attn  # the loop still aliases the core units
+    for step in range(2):
+        for m in (plain, compiled):
+            m(_batch(step, rank), labels=_batch(step, rank))["loss"].backward()
+        for (name, p), q in zip(plain.named_parameters(), compiled.parameters()):
+            assert (p.grad is None) == (q.grad is None), name
+            if p.grad is None:
+                continue
+            if name == "embed_tokens.weight":
+                # tied with the LM head: its two gradient contributions are summed in a different order when the
+                # sublayers run as registered FSDP methods (fp32 rounding, also without compile)
+                assert _rel(_full(q.grad), _full(p.grad)) < 1e-6, (step, name)
+            else:
+                assert torch.equal(_full(p.grad), _full(q.grad)), (step, name)
+        for m in (plain, compiled):
+            m.zero_grad(set_to_none=True)
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("layers_per_group,ac", [(0, False), (2, False), (2, True)],
+                         ids=["per-unit", "groups-of-2", "groups-of-2-ac"])
+def test_compiled_sublayers_match_eager_units(layers_per_group, ac, tmp_path):
+    _spawn(_sublayer_compile_worker, 2, tmp_path, layers_per_group, ac)
+
+
 # ── in-loop evals: uneven forward counts in lockstep ─────────────────────────
 
 

@@ -223,13 +223,75 @@ def compile_fsdp_units(units: list[nn.Module], **compile_kwargs: Any) -> int:
     compiled."""
     import types
 
-    compiled: dict[type, Any] = {}
+    compiled: dict[Any, Any] = {}
     for unit in units:
-        cls = type(unit)
-        base = next(c for c in cls.__mro__ if "forward" in vars(c) and not c.__name__.startswith("FSDP"))
+        base = _base_forward(unit)
         if base not in compiled:
-            compiled[base] = torch.compile(base.forward, **compile_kwargs)
+            compiled[base] = torch.compile(base, **compile_kwargs)
         unit.forward = types.MethodType(compiled[base], unit)
+    return len(compiled)
+
+
+def _base_forward(unit: nn.Module) -> Any:
+    """The unit's own class ``forward`` (unbound), skipping the FSDP subclass that ``fully_shard`` mixes in."""
+    return next(c for c in type(unit).__mro__ if "forward" in vars(c) and not c.__name__.startswith("FSDP")).forward
+
+
+def compile_fsdp_sublayers(model: nn.Module, **compile_kwargs: Any) -> int:
+    """torch.compile each AttnRes sublayer whole, under FSDP2: the compiled region is the pre-norm, the attn / ffn
+    unit's body and the residual add (the scope of :meth:`KotodamaModel.compile_regions`), and FSDP's gather /
+    reshard hooks run around it. Each unique attn / ffn unit gets a method ``kotodama_residual(norm, h, partial,
+    ...)`` registered as an FSDP forward method (``register_fsdp_forward_method``), and every layer's
+    ``attn_sublayer`` / ``mlp_sublayer`` calls it; the unit's ``forward`` and ``__call__`` are not used on this path.
+    One compiled function per sublayer kind and unit class, shared by every layer and loop repeat (parameters are
+    graph inputs). The AttnRes routing between sublayers runs as before. Returns the number of compiled functions."""
+    import types
+
+    from torch.distributed.fsdp import register_fsdp_forward_method
+
+    compiled: dict[tuple[str, type], Any] = {}
+
+    def _compiled(kind: str, unit: nn.Module) -> Any:
+        fwd = _base_forward(unit)
+        key = (kind, fwd)
+        if key not in compiled:
+            if kind == "attn":
+                def attn_residual(self: nn.Module, norm: nn.Module, h: torch.Tensor, partial: torch.Tensor,
+                                  rope_cos: torch.Tensor, rope_sin: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                                  position_ids: Optional[torch.Tensor] = None,
+                                  cu_seqlens: Optional[torch.Tensor] = None, max_seqlen: Optional[int] = None,
+                                  block_mask: Any = None) -> torch.Tensor:
+                    return partial + fwd(self, norm(h), rope_cos, rope_sin, mask, position_ids=position_ids,
+                                         cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, block_mask=block_mask)
+                compiled[key] = torch.compile(attn_residual, **compile_kwargs)
+            else:
+                def mlp_residual(self: nn.Module, norm: nn.Module, h: torch.Tensor,
+                                 partial: torch.Tensor) -> torch.Tensor:
+                    return partial + fwd(self, norm(h))
+                compiled[key] = torch.compile(mlp_residual, **compile_kwargs)
+        return compiled[key]
+
+    done: set[int] = set()
+    for layer in model.layers:  # type: ignore[attr-defined]
+        for kind, unit in (("attn", layer.attn), ("mlp", layer.ffn)):
+            if id(unit) not in done:
+                done.add(id(unit))
+                unit.kotodama_residual = types.MethodType(_compiled(kind, unit), unit)
+                register_fsdp_forward_method(unit, "kotodama_residual")
+
+    def attn_sublayer(blk: nn.Module, h: torch.Tensor, partial: torch.Tensor, rope_cos: torch.Tensor,
+                      rope_sin: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                      position_ids: Optional[torch.Tensor] = None, cu_seqlens: Optional[torch.Tensor] = None,
+                      max_seqlen: Optional[int] = None, block_mask: Any = None) -> torch.Tensor:
+        return blk.attn.kotodama_residual(blk.attn_norm, h, partial, rope_cos, rope_sin, mask, position_ids,
+                                          cu_seqlens, max_seqlen, block_mask)
+
+    def mlp_sublayer(blk: nn.Module, h: torch.Tensor, partial: torch.Tensor) -> torch.Tensor:
+        return blk.ffn.kotodama_residual(blk.ffn_norm, h, partial)
+
+    for layer in model.layers:  # type: ignore[attr-defined]
+        layer.attn_sublayer = types.MethodType(attn_sublayer, layer)
+        layer.mlp_sublayer = types.MethodType(mlp_sublayer, layer)
     return len(compiled)
 
 
