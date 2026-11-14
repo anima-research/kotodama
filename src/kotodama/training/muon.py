@@ -636,6 +636,7 @@ def build_hybrid_optimizer(
     attn_group: bool = False,
     attn_layers: Optional[set[int]] = None,
     res_query_lr_scale: float = 1.0,
+    res_query_temp_lr_scale: float = 1.0,
 ) -> tuple[Muon, "MasterAdamW"]:
     """
     Build hybrid Muon + AdamW optimizer for a transformer model.
@@ -659,12 +660,16 @@ def build_hybrid_optimizer(
     ``res_query_lr_scale`` != 1 puts the AttnRes routing queries in their own AdamW group whose LR is that multiple
     of the AdamW LR (``lr_scale``, applied by :class:`HybridScheduler`). UnitRoutingQuery temperatures (the
     ``attn_res_query_norm`` model option) always get their own group, without weight decay (decay would pull every
-    site's sharpness toward uniform routing), at the same ``lr_scale``.
+    site's sharpness toward uniform routing), at the same ``lr_scale`` times ``res_query_temp_lr_scale``. A
+    temperature LR multiple speeds the sharpness up the way a forward gain on the temperature does (AdamW steps
+    are scale-free), without multiplying the temperature's gradient, so the global clip norm is unchanged.
 
     Returns separate optimizers that should both be stepped each training step.
     """
     if res_query_lr_scale <= 0:
         raise ValueError(f"res_query_lr_scale must be > 0, got {res_query_lr_scale}")
+    if res_query_temp_lr_scale <= 0:
+        raise ValueError(f"res_query_temp_lr_scale must be > 0, got {res_query_temp_lr_scale}")
     muon_params = []
     attn_params = []
     adamw_params = []
@@ -697,6 +702,10 @@ def build_hybrid_optimizer(
         raise ValueError("attn_group=True but no attention projection weights (*.attn.*_proj.weight) found")
     muon_count = sum(p.numel() for p in muon_params) + sum(p.numel() for p in attn_params)
     adamw_count = sum(p.numel() for p in adamw_params + norm_params + query_params + temp_params)
+    if res_query_temp_lr_scale != 1.0 and not temp_params:
+        raise ValueError("res_query_temp_lr_scale != 1 but the model has no UnitRoutingQuery temperatures "
+                         "(attn_res_query_norm)")
+    temp_lr_scale = res_query_lr_scale * res_query_temp_lr_scale
     total = muon_count + adamw_count
 
     # Only print on rank 0 (or when not distributed)
@@ -714,7 +723,7 @@ def build_hybrid_optimizer(
         if query_params:
             print(f"  of which AttnRes routing queries (LR x{res_query_lr_scale:g}): {len(query_params)} tensors")
         if temp_params:
-            print(f"  of which AttnRes routing temperatures (no decay, LR x{res_query_lr_scale:g}): "
+            print(f"  of which AttnRes routing temperatures (no decay, LR x{temp_lr_scale:g}): "
                   f"{len(temp_params)} tensors")
 
     muon_groups: Any = muon_params
@@ -740,7 +749,7 @@ def build_hybrid_optimizer(
     if query_params:
         adamw_groups.append({"params": query_params, "lr_scale": res_query_lr_scale})
     if temp_params:
-        adamw_groups.append({"params": temp_params, "weight_decay": 0.0, "lr_scale": res_query_lr_scale})
+        adamw_groups.append({"params": temp_params, "weight_decay": 0.0, "lr_scale": temp_lr_scale})
     adamw_opt = MasterAdamW(
         adamw_groups,
         lr=adamw_lr,

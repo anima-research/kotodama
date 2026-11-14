@@ -200,3 +200,58 @@ def test_temperature_gain_scales_the_effective_norm():
 def test_temperature_gain_flag():
     assert _args().attnres_query_temp_gain == 1.0
     assert _args("--attnres_query_temp_gain", "39.19").attnres_query_temp_gain == 39.19
+
+
+def test_temperature_lr_scale_reaches_only_the_temperatures():
+    m = _model(True)
+    _muon, adamw = build_hybrid_optimizer(m, adamw_lr=1e-3, res_query_lr_scale=0.5, res_query_temp_lr_scale=8.0)
+    sched = HybridScheduler(_muon, adamw, warmup_steps=10, total_steps=100)
+    sched.step(50)
+    tg = _group_of(adamw, m.layers[2].parametrizations["attn_res_query"][0].temperature)
+    assert tg["lr"] == pytest.approx(4e-3) and tg["weight_decay"] == 0.0
+    qg = _group_of(adamw, m.layers[2].parametrizations["attn_res_query"].original)
+    assert qg["lr"] == pytest.approx(0.5e-3)
+
+
+def test_temperature_lr_scale_needs_unit_norm_queries_and_a_positive_scale():
+    with pytest.raises(ValueError, match="temperatures"):
+        build_hybrid_optimizer(_model(False), res_query_temp_lr_scale=8.0)
+    with pytest.raises(ValueError):
+        build_hybrid_optimizer(_model(True), res_query_temp_lr_scale=0.0)
+
+
+def _train_steps(m: KotodamaModel, steps: int, **opt_kw) -> list[float]:
+    muon, adamw = build_hybrid_optimizer(m, adamw_lr=1e-2, **opt_kw)
+    sched = HybridScheduler(muon, adamw, warmup_steps=10, total_steps=100)
+    sched.step(50)  # lr_scale reaches a group's lr through the scheduler, as in training
+    temp_grad_norms = []
+    for _ in range(steps):
+        m.zero_grad(set_to_none=True)
+        m(_ids(), labels=_ids())["loss"].backward()
+        temp_grad_norms.append(torch.cat([t.grad.flatten() for t in m.routing_temperatures()
+                                          if t.grad is not None]).norm().item())
+        muon.step()
+        adamw.step()
+    return temp_grad_norms
+
+
+def test_temperature_lr_scale_matches_the_gain_without_scaling_its_gradient():
+    """A forward gain g and an AdamW LR multiple g on the temperature give the same effective queries (AdamW steps
+    are scale-free and the temperatures start at 0 without decay); only the gain multiplies the temperature's
+    gradient, which the global clip norm sees."""
+    gain = 8.0
+    torch.manual_seed(0)
+    a = KotodamaModel(_cfg(True, temp_gain=gain))
+    torch.manual_seed(0)
+    b = KotodamaModel(_cfg(True))
+    ga = _train_steps(a, 3)
+    gb = _train_steps(b, 3, res_query_temp_lr_scale=gain)
+    assert ga[0] == pytest.approx(gain * gb[0], rel=1e-4)
+    for (module_a, attr), (module_b, _) in zip(a._routing_sites(), b._routing_sites()):
+        torch.testing.assert_close(getattr(module_a, attr), getattr(module_b, attr), rtol=1e-3, atol=1e-5)
+
+
+def test_temperature_lr_scale_flag():
+    assert _args().attnres_query_temp_lr_scale == 1.0
+    a = _args("--attnres_query_norm", "--attnres_res_gain", "folded", "--attnres_query_temp_lr_scale", "39.19")
+    assert a.attnres_query_temp_lr_scale == 39.19
