@@ -1146,7 +1146,8 @@ def train(args: argparse.Namespace) -> None:
 
     # -- Geometric monitoring (rank 0; every rank with --geo_monitor_sharded) ---
     monitor: Optional[GeometricMonitor] = None
-    geo_sharded = bool(getattr(args, "geo_monitor_sharded", False) and dist.is_initialized()
+    geo_replica = None  # under FSDP2: a plain copy of the model the monitor runs on (fsdp.MonitorReplica)
+    geo_sharded = bool((getattr(args, "geo_monitor_sharded", False) or use_fsdp2) and dist.is_initialized()
                        and dist.get_world_size() > 1)
     if args.geo_monitor and (is_main or geo_sharded):
         geo_schedule_str = getattr(args, "geo_monitor_schedule", None)
@@ -1162,7 +1163,16 @@ def train(args: argparse.Namespace) -> None:
             tier2_every=args.geo_monitor_tier2_every,
             sharded=geo_sharded,
         )
-        monitor = GeometricMonitor(model, monitor_config)
+        if use_fsdp2:
+            from kotodama.training.fsdp import MonitorReplica
+
+            geo_replica = MonitorReplica(model, device)
+            monitor = GeometricMonitor(geo_replica.model, monitor_config)
+            if is_main:
+                logger.info("Geo monitor under FSDP2: runs on a full bf16 replica on every rank, refreshed from the "
+                            "shards at each monitor step")
+        else:
+            monitor = GeometricMonitor(model, monitor_config)
 
         # Build or restore fixed probe batch for longitudinal monitoring.
         # Restoring from checkpoint ensures metrics are comparable across
@@ -1563,7 +1573,13 @@ def train(args: argparse.Namespace) -> None:
 
         # EoS sharpness (needs live gradients, must be before zero_grad)
         if monitor is not None and monitor.should_monitor(step):
-            eos_metrics = monitor.compute_sharpness(step)
+            if geo_replica is not None:
+                geo_replica.refresh(with_grads=True)
+            try:
+                eos_metrics = monitor.compute_sharpness(step)
+            finally:
+                if geo_replica is not None:
+                    geo_replica.drop_grads()
             if eos_metrics and is_main:
                 if wb is not None:
                     wb.log_geo(step, eos_metrics)
@@ -1703,6 +1719,8 @@ def train(args: argparse.Namespace) -> None:
 
         # -- Geometric monitoring (rank 0; every rank when sharded) ------------
         if monitor is not None and monitor.should_monitor(step):
+            if geo_replica is not None:
+                geo_replica.refresh()
             geo_metrics = monitor.compute_all(step)
             if geo_metrics and is_main:
                 if wb is not None:
@@ -2240,7 +2258,6 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
             args, "fp8_recipe", "tensorwise") != "mxfp8",
         "--micro_grad_stats (a DDP comm hook)": getattr(args, "micro_grad_stats", False),
         "--spike_capture_factor (needs --micro_grad_stats)": bool(getattr(args, "spike_capture_factor", 0.0)),
-        "--geo_monitor (its probes run rank-local forwards; use --no_geo_monitor)": getattr(args, "geo_monitor", False),
     }
     bad = [name for name, on in unsupported.items() if on]
     if bad:

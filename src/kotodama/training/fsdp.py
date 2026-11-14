@@ -351,6 +351,51 @@ def compile_fsdp_layers(model: nn.Module, **compile_kwargs: Any) -> None:
     model._layer_region = fsdp_region  # type: ignore[attr-defined]
 
 
+class MonitorReplica:
+    """A plain (unsharded, unhooked) copy of an FSDP2-sharded KotodamaModel on every rank, for the geometric monitor.
+
+    The monitor reads weights, perturbs them, runs rank-local probe forwards and calls layer pieces directly; on a
+    sharded model each of those would read shards or fire gather hooks out of step across ranks. So the monitor is
+    built on this replica, and :meth:`refresh` (collective: every rank) copies the full parameters, and for the
+    sharpness probe the gradients, from the sharded model before each monitor event. The sharded fp32 masters are
+    never written. The replica is a fresh instance of the model's class and config in ``dtype`` (the compute dtype);
+    an MXFP8-swapped run's replica computes in that dtype too. It costs one full copy of the weights per rank (plus one
+    of the gradients while a sharpness probe holds them)."""
+
+    def __init__(self, model: nn.Module, device: torch.device, dtype: torch.dtype = torch.bfloat16) -> None:
+        raw = getattr(model, "_orig_mod", model)
+        self.source = raw
+        with torch.device(device):
+            replica = type(raw)(raw.config, init_weights=False)  # type: ignore[call-arg]
+        self.model = replica.to(dtype=dtype)
+        src_names = [n for n, _ in raw.named_parameters()]
+        dst_names = [n for n, _ in self.model.named_parameters()]
+        if src_names != dst_names:
+            missing = sorted(set(src_names) ^ set(dst_names))
+            raise ValueError(f"MonitorReplica: parameter names differ from the sharded model: {missing[:6]}")
+        self._pairs = list(zip([p for _, p in raw.named_parameters()], self.model.parameters()))
+
+    @torch.no_grad()
+    def refresh(self, with_grads: bool = False) -> None:
+        """Copy the full parameters (and with ``with_grads`` the gradients, None where the source has none) from the
+        sharded model into the replica. Collective."""
+        for src, dst in self._pairs:
+            full = src.full_tensor() if is_dtensor(src) else src.detach()
+            dst.copy_(full.to(dst.dtype))
+            if with_grads:
+                g = src.grad
+                if g is None:
+                    dst.grad = None
+                else:
+                    g_full = g.full_tensor() if is_dtensor(g) else g
+                    dst.grad = g_full.to(dst.dtype)
+        self.model.train(self.source.training)
+
+    def drop_grads(self) -> None:
+        for _, dst in self._pairs:
+            dst.grad = None
+
+
 def is_fsdp2(model: nn.Module) -> bool:
     """True when ``model`` (or the module it wraps) has been through :func:`apply_fsdp2`."""
     from torch.distributed.fsdp import FSDPModule

@@ -690,6 +690,50 @@ def test_node_local_checkpoints(tmp_path):
     _spawn(_node_local_worker, 4, tmp_path / "d", str(base), str(out), "resume-common-step")
 
 
+def _monitor_replica_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
+    from kotodama.training.fsdp import MonitorReplica
+
+    _init(rank, world, init_file)
+    ref = _reference()
+    model = _sharded(ref, init_device_mesh("cpu", (world,)))
+    batch = _batch(0, 0)  # the same batch on every rank: the sharded (rank-mean) gradient equals the plain one
+    ref(batch, labels=batch)["loss"].backward()
+    model(batch, labels=batch)["loss"].backward()
+
+    replica = MonitorReplica(model, torch.device("cpu"), dtype=torch.float32)
+    replica.refresh(with_grads=True)
+    for (name, p), q in zip(ref.named_parameters(), replica.model.parameters()):
+        assert torch.equal(p.detach(), q.detach()), name
+        assert (p.grad is None) == (q.grad is None), name
+        if p.grad is not None:
+            assert _rel(q.grad, p.grad) < 1e-6, name
+
+    probe = torch.cat([_batch(9, 0), _batch(10, 0)])  # 4 sequences, split over the ranks by the monitor
+    cfg = dict(schedule=MonitorSchedule.fixed(1), sharded=True, tier1_probe_size=4)
+    mon_ref = GeometricMonitor(ref, MonitorConfig(**cfg))
+    mon_rep = GeometricMonitor(replica.model, MonitorConfig(**cfg))
+    for m in (mon_ref, mon_rep):
+        m.set_probe_batch(probe)
+    sharp_ref, sharp_rep = mon_ref.compute_sharpness(0, n_sequences=4), mon_rep.compute_sharpness(0, n_sequences=4)
+    assert sharp_ref and sharp_ref.keys() == sharp_rep.keys()
+    for k in sharp_ref:
+        if k != "eos/time_s":
+            assert math.isclose(sharp_ref[k], sharp_rep[k], rel_tol=1e-5, abs_tol=1e-7), (k, sharp_ref[k], sharp_rep[k])
+    replica.drop_grads()
+    assert all(q.grad is None for q in replica.model.parameters())
+    # the sharded model's masters are untouched by the replica's perturbations
+    for (name, p), q in zip(ref.named_parameters(), model.parameters()):
+        assert torch.equal(p.detach(), _full(q.detach())), name
+    dist.destroy_process_group()
+
+
+def test_monitor_replica_matches_the_unsharded_model(tmp_path):
+    _spawn(_monitor_replica_worker, 2, tmp_path)
+
+
 def test_sharded_manager_refuses_unsharded_checkpoints(tmp_path):
     from kotodama.training.checkpoint import ShardedCheckpointManager
 
@@ -776,7 +820,8 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
     validate_fsdp2_args(ok)
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "inloop_evals": "riders,induction"}))
     validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "fp8": True, "fp8_recipe": "mxfp8"}))
-    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise"), dict(geo_monitor=True)):
+    validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "geo_monitor": True}))  # runs on a replica
+    for bad in (dict(tp_size=2), dict(fp8=True, fp8_recipe="tensorwise")):
         with pytest.raises(ValueError, match="does not support"):
             validate_fsdp2_args(argparse.Namespace(**{**vars(ok), **bad}))
     with pytest.raises(ValueError, match="needs --fsdp2"):
