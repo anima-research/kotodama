@@ -465,6 +465,7 @@ def train(args: argparse.Namespace) -> None:
     model_kwargs["use_liger"] = getattr(args, "use_liger", False)
     model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
     model_kwargs["attn_res_query_norm"] = getattr(args, "attnres_query_norm", False)
+    model_kwargs["attn_res_query_temp_gain"] = getattr(args, "attnres_query_temp_gain", 1.0)
     model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
     model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
     model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
@@ -2531,6 +2532,12 @@ def parse_args() -> argparse.Namespace:
         help="AttnRes routing queries as temperature * q / |q| (a learned per-site sharpness and a unit direction; "
              "the temperature starts at 0, so routing starts uniform as with zero-init queries). New runs only; needs "
              "--attnres_res_gain folded or frozen.",
+    )
+    p.add_argument(
+        "--attnres_query_temp_gain", type=float, default=1.0,
+        help="With --attnres_query_norm: constant gain on each routing temperature (effective sharpness = gain x "
+             "temperature). AdamW moves the scalar temperature by ~lr per step, a plain query's norm by ~lr*sqrt(D); "
+             "sqrt(hidden_size) (39.19 at 1536) matches the plain query's rate.",
     )
     p.add_argument(
         "--attnres_query_lr_scale", type=float, default=1.0,
