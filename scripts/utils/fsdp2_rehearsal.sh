@@ -11,7 +11,8 @@
 #                   node k to OUT/train.node<k>.log)
 #   STEPS           total optimizer steps (2,097,152 tokens each)
 #   STOP_AFTER_MIN  0: no stop; N: one requested stop after N minutes, then the resume
-# SAVE_EVERY (env, default 100 steps; 0 disables every save) sets the periodic save cadence.
+# SAVE_EVERY (env, default 100 steps; 0 disables every save) sets the periodic save cadence; BOUNDARIES (env) the
+# AttnRes block starts.
 set -euo pipefail
 ARM="$1"; OUT="$2"; DATA="$3"; STEPS="$4"; STOP_AFTER="$5"; shift 5
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -26,7 +27,11 @@ esac
 REPL=()
 if [ "$NNODES" -gt 1 ]; then REPL=(--fsdp2_replicas "$NNODES"); fi
 mkdir -p "$OUT"
-FLAGS=(--config "$ROOT/configs/tsumugi-1b.yaml" --model_size 10b-bench-spire --attn_res_boundaries= --attn_res_n_blocks 8
+# Eight AttnRes blocks cut at the loop seams (30 | 70 | 110 of the 140 effective layers), as syzygy's boundaries are.
+BOUNDARIES="${BOUNDARIES:-0,1,10,20,30,70,110,125}"
+# Every rank's batch digests at every step: two arms with the same data seed compare step for step, across a resume.
+export KOTODAMA_DEBUG_BATCH_HASH="${KOTODAMA_DEBUG_BATCH_HASH:-$STEPS}"
+FLAGS=(--config "$ROOT/configs/tsumugi-1b.yaml" --model_size 10b-bench-spire --attn_res_n_blocks 8 --attn_res_boundaries "$BOUNDARIES"
        --no_attnres_eps_fp64_compat --mix_fraction 0 --data_path "$DATA" --global_batch_tokens 2097152
        --total_steps "$STEPS" --log_every 1
        --fsdp2 "${REPL[@]}" --fsdp2_compile_scope layer --activation_checkpointing --micro_batch_size 8
