@@ -217,6 +217,33 @@ def check_finite_loss(step_loss: float, step: int, device: torch.device, checkpo
                            f"(the last good checkpoint in {checkpoint_dir} is untouched)")
 
 
+def any_rank_stopping(received: bool, device: torch.device) -> bool:
+    """True on every rank when any rank has received a stop request (SIGTERM). A preemption signal reaches each rank
+    and each node at its own moment; a rank that stopped on its own flag would enter the stop save (collective)
+    while the others ran the next step, and the job would hang. Collective when distributed."""
+    flag = torch.tensor([1.0 if received else 0.0], device=device)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item() > 0)
+
+
+def stop_saved_marker(stop_file: Path) -> Path:
+    """The file a run writes beside its ``--stop_file`` once a requested stop has saved (or skipped its save)."""
+    return stop_file.with_name(stop_file.name + ".saved")
+
+
+def mark_stop_saved(stop_file: Optional[Path], is_main: bool) -> None:
+    """After a requested stop's checkpoint is on disk on every rank: rank 0 writes the ``.saved`` marker, which a
+    scheduler's pre-stop hook waits for before it signals the job (so no signal lands mid-save). Collective when
+    distributed."""
+    if stop_file is None:
+        return
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.barrier()
+    if is_main:
+        stop_saved_marker(stop_file).write_text("saved\n")
+
+
 FROZEN_ROUTING_CHECK_STEP = 50
 
 
@@ -1144,6 +1171,15 @@ def train(args: argparse.Namespace) -> None:
 
     # -- SIGTERM handler -------------------------------------------------------
     sigterm = SIGTERMHandler()
+    stopping = False  # the stop request every rank has agreed on (any_rank_stopping, once per step)
+    stop_file = Path(args.stop_file) if getattr(args, "stop_file", None) else None
+    if stop_file is not None:
+        # A request (or its marker) left from an earlier stop would end this run at its first step.
+        if is_main:
+            for _f in (stop_file, stop_saved_marker(stop_file)):
+                _f.unlink(missing_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
 
     # -- Geometric monitoring (rank 0; every rank with --geo_monitor_sharded) ---
     monitor: Optional[GeometricMonitor] = None
@@ -1804,9 +1840,15 @@ def train(args: argparse.Namespace) -> None:
                 data_state=_current_data_state(), extra=_extra_anchor or None,
             )
 
+        # -- Stop request, agreed by every rank ----------------------------------
+        # A SIGTERM reaches each rank (and each node) at its own moment. Every stop decision below reads this one
+        # agreed value, so all ranks run the same collectives (evals, the stop save, the final save).
+        stopping = stopping or any_rank_stopping(
+            sigterm.received or (stop_file is not None and stop_file.exists()), device)
+
         # -- In-loop evals (weights == checkpoint step_<step>) -------------------
         if inloop is not None and inloop.due(step):
-            _il = inloop.run(step, model, tokens_consumed, stop_requested=sigterm.received)
+            _il = inloop.run(step, model, tokens_consumed, stop_requested=stopping)
             if _il and wb is not None:
                 wb.log_custom(step, _il)
 
@@ -1818,14 +1860,15 @@ def train(args: argparse.Namespace) -> None:
         if wb is not None:
             wb.commit(step)
 
-        # -- SIGTERM check -----------------------------------------------------
-        if sigterm.received:
+        # -- Stop request (SIGTERM or --stop_file) -------------------------------
+        if stopping:
             if args.save_every <= 0:
                 if is_main:
-                    logger.info("SIGTERM exit — checkpoint skipped (save_every<=0)")
+                    logger.info("Stop request — exiting, checkpoint skipped (save_every<=0)")
+                mark_stop_saved(stop_file, is_main)
                 break
             if is_main:
-                logger.info("SIGTERM exit — saving checkpoint at step %d", step)
+                logger.info("Stop request — saving checkpoint at step %d", step)
             data_state = _current_data_state()
             # Use blocking save for SIGTERM (async may not finish before SIGKILL)
             save_fn = (
@@ -1846,6 +1889,7 @@ def train(args: argparse.Namespace) -> None:
                 data_state=data_state,
                 extra=_extra_sigterm or None,
             )
+            mark_stop_saved(stop_file, is_main)
             break
 
     # -- Final -----------------------------------------------------------------
@@ -1853,13 +1897,13 @@ def train(args: argparse.Namespace) -> None:
     # save_every <= 0 disables ALL saves (benchmark/canary runs): a 7B final
     # checkpoint is ~30GB+, more than a small root filesystem holds, and an
     # ENOSPC on that final save crashes a run that already completed.
-    if not sigterm.received and args.save_every <= 0:
+    if not stopping and args.save_every <= 0:
         if is_main:
             logger.info(
                 "Training complete: %d steps, %.2fB tokens (no checkpoint — save_every<=0)",
                 total_steps, tokens_consumed / 1e9,
             )
-    elif not sigterm.received:
+    elif not stopping:
         if is_main:
             logger.info(
                 "Training complete: %d steps%s, %.2fB tokens",
@@ -1891,7 +1935,7 @@ def train(args: argparse.Namespace) -> None:
         ckpt_mgr.shutdown()
 
     # Upload final checkpoint to HuggingFace
-    if is_main and not sigterm.received and getattr(args, "hf_upload_repo", None):
+    if is_main and not stopping and getattr(args, "hf_upload_repo", None):
         _upload_checkpoint_to_hf(
             repo_id=args.hf_upload_repo,
             checkpoint_dir=Path(args.checkpoint_dir),
@@ -2555,6 +2599,14 @@ def parse_args() -> argparse.Namespace:
     # Checkpointing
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument(
+        "--stop_file", type=str, default=None,
+        help="A path that, once it exists, asks the run to stop like SIGTERM does: at the next step boundary every "
+             "rank saves a checkpoint and exits, then rank 0 writes <stop_file>.saved. A scheduler's pre-stop hook "
+             "(heimdall --on-preempt) creates the file and waits for the marker, so the stop save never races a "
+             "signal or the launcher's own shutdown timeout (torchrun kills workers 30 s after its SIGTERM). Every "
+             "rank checks it, so under several nodes put it on a filesystem they share. Cleared at startup.",
+    )
     p.add_argument("--keep_checkpoints", type=int, default=5)
     p.add_argument(
         "--save_schedule", type=str, default=None,

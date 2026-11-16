@@ -1,5 +1,6 @@
-"""Trainer safety rails: a non-finite loss stops every rank before the optimizer step, and no save path writes
-non-finite weights (so rotation can never evict the last good checkpoint for a bad one)."""
+"""Trainer safety rails: a non-finite loss stops every rank before the optimizer step, a stop request (SIGTERM) seen
+by one rank stops every rank at the same step, and no save path writes non-finite weights (so rotation can never
+evict the last good checkpoint for a bad one)."""
 
 from __future__ import annotations
 
@@ -58,3 +59,34 @@ def _loss_worker(rank: int, world: int, init_file: str) -> None:
 
 def test_non_finite_loss_on_one_rank_stops_every_rank(tmp_path):
     mp.spawn(_loss_worker, args=(3, str(tmp_path / "pg-init")), nprocs=3, join=True)
+
+
+def _stop_worker(rank: int, world: int, init_file: str) -> None:
+    from kotodama.training.train import any_rank_stopping
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    assert any_rank_stopping(False, torch.device("cpu")) is False  # nobody signalled: every rank trains on
+    # Only the last rank has seen the signal so far; every rank must agree to stop at this step.
+    assert any_rank_stopping(rank == world - 1, torch.device("cpu")) is True
+    dist.destroy_process_group()
+
+
+def test_stop_request_on_one_rank_stops_every_rank(tmp_path):
+    from kotodama.training.train import any_rank_stopping
+
+    assert any_rank_stopping(True, torch.device("cpu")) is True  # single process: its own flag
+    assert any_rank_stopping(False, torch.device("cpu")) is False
+    mp.spawn(_stop_worker, args=(3, str(tmp_path / "pg-init")), nprocs=3, join=True)
+
+
+def test_requested_stop_writes_its_marker_after_the_save(tmp_path):
+    from kotodama.training.train import mark_stop_saved, stop_saved_marker
+
+    stop = tmp_path / "STOP"
+    assert stop_saved_marker(stop) == tmp_path / "STOP.saved"
+    mark_stop_saved(None, is_main=True)  # no --stop_file: nothing to mark
+    assert not list(tmp_path.iterdir())
+    mark_stop_saved(stop, is_main=False)  # only rank 0 writes the marker
+    assert not stop_saved_marker(stop).exists()
+    mark_stop_saved(stop, is_main=True)
+    assert stop_saved_marker(stop).read_text() == "saved\n"
