@@ -248,7 +248,9 @@ def test_temperature_lr_scale_matches_the_gain_without_scaling_its_gradient():
     gb = _train_steps(b, 3, res_query_temp_lr_scale=gain)
     assert ga[0] == pytest.approx(gain * gb[0], rel=1e-4)
     for (module_a, attr), (module_b, _) in zip(a._routing_sites(), b._routing_sites()):
-        torch.testing.assert_close(getattr(module_a, attr), getattr(module_b, attr), rtol=1e-3, atol=1e-5)
+        # Float paths differ across CPUs (AMX / AVX-512 reductions drift ~2e-5 after three Muon + AdamW steps); a group
+        # whose lr_scale never reaches its lr is off by ~5e-2.
+        torch.testing.assert_close(getattr(module_a, attr), getattr(module_b, attr), rtol=1e-2, atol=1e-4)
 
 
 def test_temperature_lr_scale_flag():
