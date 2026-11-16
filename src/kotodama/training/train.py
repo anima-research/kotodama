@@ -926,6 +926,7 @@ def train(args: argparse.Namespace) -> None:
             attn_group=_attn_lr_scaled(args),
             attn_layers=parse_layer_range(getattr(args, "attn_lr_scale_layers", "")),
             res_query_lr_scale=getattr(args, "attnres_query_lr_scale", 1.0),
+            res_query_temp_lr_scale=getattr(args, "attnres_query_temp_lr_scale", 1.0),
         )
 
     # -- Compute training geometry ---------------------------------------------
@@ -2869,7 +2870,16 @@ def parse_args() -> argparse.Namespace:
         "--attnres_query_temp_gain", type=float, default=1.0,
         help="With --attnres_query_norm: constant gain on each routing temperature (effective sharpness = gain x "
              "temperature). AdamW moves the scalar temperature by ~lr per step, a plain query's norm by ~lr*sqrt(D); "
-             "sqrt(hidden_size) (39.19 at 1536) matches the plain query's rate.",
+             "sqrt(hidden_size) (39.19 at 1536) matches the plain query's rate. The gain also multiplies the "
+             "temperature's gradient, which enters the global clip norm; --attnres_query_temp_lr_scale gives the same "
+             "rate without that.",
+    )
+    p.add_argument(
+        "--attnres_query_temp_lr_scale", type=float, default=1.0,
+        help="With --attnres_query_norm: AdamW LR multiplier for the routing temperatures alone (on top of "
+             "--attnres_query_lr_scale). sqrt(hidden_size) matches a plain query's sharpening rate like "
+             "--attnres_query_temp_gain does, but leaves the gradient (and so the global clip) unscaled. A run with "
+             "a scale != 1 cannot resume a checkpoint built without it.",
     )
     p.add_argument(
         "--attnres_query_lr_scale", type=float, default=1.0,
