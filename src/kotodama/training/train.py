@@ -465,6 +465,32 @@ class _FlexBlockMaskBuilder:
         )
 
 
+def build_model_config(args: argparse.Namespace) -> KotodamaModelConfig:
+    """The model config a run trains: its --model_size preset with the run's model flags applied."""
+    model_kwargs = MODEL_CONFIGS[args.model_size].copy()
+    # The RoPE table covers the training context: positions reset per document, so a document longer than the preset's
+    # max_position_embeddings inside a longer --sequence_length would index past it. Growing it leaves every position
+    # below the old length unchanged.
+    model_kwargs["max_position_embeddings"] = max(model_kwargs.get("max_position_embeddings", 0), args.sequence_length)
+    model_kwargs["qk_norm"] = True
+    model_kwargs["z_loss_weight"] = args.z_loss_weight
+    model_kwargs["activation_checkpointing"] = args.activation_checkpointing
+    model_kwargs["use_liger"] = getattr(args, "use_liger", False)
+    model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
+    model_kwargs["attn_res_query_norm"] = getattr(args, "attnres_query_norm", False)
+    model_kwargs["attn_res_query_temp_gain"] = getattr(args, "attnres_query_temp_gain", 1.0)
+    model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
+    model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
+    model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
+    model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
+    model_kwargs["attn_res"] = args.attn_res
+    model_kwargs["attn_res_n_blocks"] = args.attn_res_n_blocks
+    model_kwargs["attn_res_freeze_unused"] = getattr(args, "attn_res_freeze_unused", True)
+    if args.attn_res_boundaries:
+        model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
+    return KotodamaModelConfig(**model_kwargs)
+
+
 def setup_distributed() -> tuple[int, int, int]:
     """Initialize NCCL process group.  Returns (rank, world_size, local_rank)."""
     dist.init_process_group("nccl")
@@ -532,24 +558,7 @@ def train(args: argparse.Namespace) -> None:
             f"Choose from: {list(MODEL_CONFIGS.keys())}"
         )
 
-    model_kwargs = MODEL_CONFIGS[args.model_size].copy()
-    model_kwargs["qk_norm"] = True
-    model_kwargs["z_loss_weight"] = args.z_loss_weight
-    model_kwargs["activation_checkpointing"] = args.activation_checkpointing
-    model_kwargs["use_liger"] = getattr(args, "use_liger", False)
-    model_kwargs["attn_res_gain"] = getattr(args, "attnres_res_gain", "learned")
-    model_kwargs["attn_res_query_norm"] = getattr(args, "attnres_query_norm", False)
-    model_kwargs["attn_res_query_temp_gain"] = getattr(args, "attnres_query_temp_gain", 1.0)
-    model_kwargs["liger_rmsnorm_tuned"] = getattr(args, "liger_rmsnorm_tuned", False)
-    model_kwargs["liger_rmsnorm_tuned_scope"] = getattr(args, "liger_rmsnorm_tuned_scope", "all")
-    model_kwargs["rope_fp32"] = getattr(args, "rope_fp32", False)
-    model_kwargs["attn_impl"] = getattr(args, "attn_impl", "auto")
-    model_kwargs["attn_res"] = args.attn_res
-    model_kwargs["attn_res_n_blocks"] = args.attn_res_n_blocks
-    model_kwargs["attn_res_freeze_unused"] = getattr(args, "attn_res_freeze_unused", True)
-    if args.attn_res_boundaries:
-        model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
-    config = KotodamaModelConfig(**model_kwargs)
+    config = build_model_config(args)
 
     # Seed the init: without this every run of the same config draws different
     # initial weights (data order is already seeded in the dataset). DDP then
