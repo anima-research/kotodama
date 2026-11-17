@@ -61,13 +61,20 @@ echo "fsdp2-rehearsal arm=$ARM nodes=$NNODES node=$NODE_RANK steps=$STEPS stop_a
 run() { "$ROOT/tools/run_train.sh" "${FLAGS[@]}" 2>&1 | tee -a "$LOG"; }
 
 TIMER=""
+stop_timer() { if [ -n "$TIMER" ]; then kill "$TIMER" 2>/dev/null || true; TIMER=""; fi; }
+trap stop_timer EXIT
 if [ "$STOP_AFTER" -gt 0 ] && [ "$NODE_RANK" = 0 ]; then
-  ( sleep $((STOP_AFTER * 60)); echo "fsdp2-rehearsal: requesting a stop ($(date -u +%T))" | tee -a "$LOG"
+  # The timer polls and checks this script is still alive, so it can never outlive its run (a timer left by an
+  # earlier, failed run would otherwise stop a later run sharing CONTROL_DIR).
+  PARENT=$$
+  ( END=$((SECONDS + STOP_AFTER * 60))
+    while [ "$SECONDS" -lt "$END" ]; do sleep 5; kill -0 "$PARENT" 2>/dev/null || exit 0; done
+    echo "fsdp2-rehearsal: requesting a stop ($(date -u +%T))" | tee -a "$LOG"
     touch "$CONTROL_DIR/STOP" ) &
   TIMER=$!
 fi
 run
-if [ -n "$TIMER" ]; then kill "$TIMER" 2>/dev/null || true; fi
+stop_timer
 [ "$STOP_AFTER" -gt 0 ] || exit 0
 
 # A requested stop leaves CONTROL_DIR/STOP.saved once its checkpoint is on disk; a run that reached STEPS leaves none.
