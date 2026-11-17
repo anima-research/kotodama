@@ -90,3 +90,19 @@ def test_requested_stop_writes_its_marker_after_the_save(tmp_path):
     assert not stop_saved_marker(stop).exists()
     mark_stop_saved(stop, is_main=True)
     assert stop_saved_marker(stop).read_text() == "saved\n"
+
+
+def _mean_worker(rank: int, world: int, init_file: str) -> None:
+    from kotodama.training.train import step_losses
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    loss, z = step_losses(float(rank + 1), 0.1 * (rank + 1), step=3, device=torch.device("cpu"), checkpoint_dir="c")
+    assert loss == pytest.approx(2.0) and z == pytest.approx(0.2)  # ranks hold 1, 2, 3: the batch mean is 2
+    dist.destroy_process_group()
+
+
+def test_step_loss_is_the_mean_over_every_rank(tmp_path):
+    from kotodama.training.train import step_losses
+
+    assert step_losses(2.5, 0.1, step=1, device=torch.device("cpu"), checkpoint_dir="c") == (2.5, 0.1)
+    mp.spawn(_mean_worker, args=(3, str(tmp_path / "pg-init")), nprocs=3, join=True)

@@ -45,8 +45,9 @@ REPL=()
 if [ "$NNODES" -gt 1 ]; then REPL=(--fsdp2_replicas "$NNODES" --fsdp2_replica0_checkpoints); fi
 # Eight AttnRes blocks cut at the loop seams (30 | 70 | 110 of the 140 effective layers), as syzygy's boundaries are.
 BOUNDARIES="${BOUNDARIES:-0,1,10,20,30,70,110,125}"
-# Every rank's batch digests at every step: two arms with the same data seed compare step for step, across a resume.
-export KOTODAMA_DEBUG_BATCH_HASH="${KOTODAMA_DEBUG_BATCH_HASH:-$STEPS}"
+# KOTODAMA_DEBUG_BATCH_HASH=STEPS logs every rank's batch digests at every step, so two arms with the same data seed
+# compare step for step across a resume (off by default: four lines per step).
+export KOTODAMA_DEBUG_BATCH_HASH="${KOTODAMA_DEBUG_BATCH_HASH:-0}"
 FLAGS=(--config "$ROOT/configs/tsumugi-1b.yaml" --model_size 10b-bench-spire --attn_res_n_blocks 8
        --attn_res_boundaries "$BOUNDARIES" --no_attnres_eps_fp64_compat --mix_fraction 0 --data_path "$DATA"
        --global_batch_tokens 2097152 --total_steps "$STEPS" --log_every 1

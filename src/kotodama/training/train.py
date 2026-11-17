@@ -208,13 +208,26 @@ def check_rank_batches_distinct(ids: torch.Tensor, group: Any, device: torch.dev
 def check_finite_loss(step_loss: float, step: int, device: torch.device, checkpoint_dir: Any) -> None:
     """Stop the run, on every rank at once, when any rank's step loss is non-finite: before the optimizer step and
     before any save, so NaN weights are never trained on or written over the last good checkpoint (an auto-retry
-    then resumes from that checkpoint). Collective when distributed."""
-    bad = torch.tensor([0.0 if math.isfinite(step_loss) else 1.0], device=device)
+    then resumes from that checkpoint). Collective when distributed; the training loop runs this rule inside
+    :func:`step_losses`."""
+    step_losses(step_loss, 0.0, step, device, checkpoint_dir)
+
+
+def step_losses(loss: float, z_loss: float, step: int, device: torch.device,
+                checkpoint_dir: Any) -> tuple[float, float]:
+    """The step's loss and z-loss averaged over every data-parallel rank (each rank holds an equal share of the batch,
+    so this is the whole batch's mean), in the one all-reduce that also stops every rank when any rank's loss is
+    non-finite (:func:`check_finite_loss`'s rule). Collective when distributed."""
+    t = torch.tensor([loss, z_loss, 0.0 if math.isfinite(loss) else 1.0], device=device, dtype=torch.float64)
+    world = 1
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
-    if bad.item() > 0:
-        raise RuntimeError(f"non-finite loss at step {step} (this rank: {step_loss}); exiting without saving "
+        world = dist.get_world_size()
+        dist.all_reduce(t)
+    mean_loss, mean_z, bad = t.tolist()
+    if bad > 0:
+        raise RuntimeError(f"non-finite loss at step {step} (this rank: {loss}); exiting without saving "
                            f"(the last good checkpoint in {checkpoint_dir} is untouched)")
+    return mean_loss / world, mean_z / world
 
 
 def any_rank_stopping(received: bool, device: torch.device) -> bool:
@@ -512,14 +525,20 @@ def cleanup_distributed() -> None:
 # =============================================================================
 
 
+QUIET_LOGGERS = ("httpx", "httpcore", "flash_attn.cute.cache_utils")
+
+
 def setup_logging(rank: int) -> None:
-    """Configure logging — only rank 0 logs to stdout."""
+    """Configure logging — only rank 0 logs to stdout. Per-request HTTP lines (telemetry posts) and flash-attn's JIT
+    cache DEBUG lines (that module sets its own logger to DEBUG when imported) are raised to WARNING."""
     level = logging.INFO if rank == 0 else logging.WARNING
     logging.basicConfig(
         level=level,
         format=f"[rank {rank}] %(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -1421,6 +1440,7 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     step_t0 = time.time()
     log_loss_accum = 0.0
+    log_loss_rank0_accum = 0.0
     log_z_loss_accum = 0.0
     log_steps = 0
     log_data_wait = 0.0
@@ -1544,9 +1564,9 @@ def train(args: argparse.Namespace) -> None:
                 _z_loss_accum += output["z_loss"].detach()
 
         # Single GPU→CPU sync after all micro-steps
-        step_loss = _loss_accum.item() / current_grad_accum
-        check_finite_loss(step_loss, step, device, args.checkpoint_dir)
-        step_z_loss = _z_loss_accum.item() / current_grad_accum
+        step_loss_rank0 = _loss_accum.item() / current_grad_accum  # this rank's share (rank 0's is logged too)
+        step_loss, step_z_loss = step_losses(step_loss_rank0, _z_loss_accum.item() / current_grad_accum, step,
+                                             device, args.checkpoint_dir)
 
         # TP: sync QK-norm gradients (they see sharded heads, need SUM)
         if tp_group is not None and dp_size == 1:
@@ -1660,6 +1680,7 @@ def train(args: argparse.Namespace) -> None:
 
         # -- Logging -----------------------------------------------------------
         log_loss_accum += step_loss
+        log_loss_rank0_accum += step_loss_rank0
         log_z_loss_accum += step_z_loss
         _loss_win_max = max(_loss_win_max, step_loss)
         log_steps += 1
@@ -1728,6 +1749,7 @@ def train(args: argparse.Namespace) -> None:
                 hm_log(
                     step,
                     **{"train/loss": avg_loss, "train/grad_norm": _grad_norm_scalar,
+                       "train/loss_rank0": log_loss_rank0_accum / max(log_steps, 1),
                        "train/perplexity": math.exp(min(avg_loss, 20)),
                        "train/loss_max": _loss_win_max,
                        "train/grad_norm_max": _gn_max_s,
@@ -1751,6 +1773,7 @@ def train(args: argparse.Namespace) -> None:
 
             # Reset accumulators
             log_loss_accum = 0.0
+            log_loss_rank0_accum = 0.0
             log_z_loss_accum = 0.0
             _gn_win_max = torch.zeros((), device=device)
             _gn_win_clipped = torch.zeros((), device=device)
