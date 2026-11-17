@@ -690,6 +690,65 @@ def test_node_local_checkpoints(tmp_path):
     _spawn(_node_local_worker, 4, tmp_path / "d", str(base), str(out), "resume-common-step")
 
 
+def _replica0_worker(rank: int, world: int, init_file: str, base: str, out_dir: str, phase: str) -> None:
+    import shutil
+
+    import torch.distributed.checkpoint as dcp
+
+    from kotodama.training.checkpoint import ShardedCheckpointManager
+    from kotodama.training.fsdp import build_mesh
+
+    _init(rank, world, init_file)
+    mesh = build_mesh(world, 2, device_type="cpu")
+    writer = mesh["replicate"].get_local_rank() == 0
+    if not writer:  # replica 1 sees the directory read-only: any write from it fails the test
+        def _refuse(*a, **k):
+            raise AssertionError(f"rank {rank} (replica 1) wrote to the checkpoint")
+        dcp.save, torch.save, shutil.rmtree, Path.rename, Path.mkdir = _refuse, _refuse, _refuse, _refuse, _refuse
+    model = _sharded(_reference(), mesh)
+    muon, adamw = _optimizers(model)
+    sched = HybridScheduler(muon, adamw, warmup_steps=2, total_steps=20, decay_start_pct=0.5)
+    mgr = ShardedCheckpointManager(Path(base), rank=rank, keep_last_n=1, group=mesh["shard"].get_group(),
+                                   writer=writer)
+    if phase == "save":
+        _train_steps(model, muon, adamw, sched, rank, 0, 3)
+        mgr.save(step=2, model=model, muon_opt=muon, adamw_opt=adamw, scheduler=sched, tokens_consumed=11)
+        _train_steps(model, muon, adamw, sched, rank, 3, 2)
+        mgr.save(step=4, model=model, muon_opt=muon, adamw_opt=adamw, scheduler=sched, tokens_consumed=22)
+        saved4 = full_model_state_dict(model)
+        _train_steps(model, muon, adamw, sched, rank, 5, 2)
+        final = full_model_state_dict(model)
+        if rank == 0:
+            torch.save({"saved4": saved4, "final": final}, Path(out_dir) / "run.pt")
+    else:
+        meta = mgr.load_latest(model, muon, adamw, torch.device("cpu"))
+        assert meta["step"] == 4
+        loaded = full_model_state_dict(model)
+        _train_steps(model, muon, adamw, sched, rank, 5, 2)
+        final = full_model_state_dict(model)
+        if rank == 0:
+            want = torch.load(Path(out_dir) / "run.pt")
+            for k, v in want["saved4"].items():
+                assert torch.equal(loaded[k], v), ("load", k)
+            for k, v in want["final"].items():  # the resumed run reproduces the uninterrupted one exactly
+                assert torch.equal(final[k], v), ("resume", k)
+    dist.destroy_process_group()
+
+
+def test_replica0_checkpoints(tmp_path):
+    """HSDP, 2 replicas x 2 ranks, one shared directory that only replica 0 writes (replica 1 would see it read-only):
+    a complete checkpoint lands there, rotation keeps one, and every replica resumes from it bitwise."""
+    base, out = tmp_path / "ckpt", tmp_path / "out"
+    out.mkdir()
+    for d in "ab":
+        (tmp_path / d).mkdir()
+    _spawn(_replica0_worker, 4, tmp_path / "a", str(base), str(out), "save")
+    assert sorted(d.name for d in base.iterdir()) == ["step_00000004.dcp"]
+    assert (base / "step_00000004.dcp" / "meta.pt").is_file()
+    assert (base / "step_00000004.dcp" / ".metadata").is_file()
+    _spawn(_replica0_worker, 4, tmp_path / "b", str(base), str(out), "resume")
+
+
 def _monitor_replica_worker(rank: int, world: int, init_file: str) -> None:
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -828,3 +887,8 @@ def test_fsdp2_flag_refuses_unsupported_combinations():
         validate_fsdp2_args(argparse.Namespace(fsdp2=False, fsdp2_replicas=2))
     with pytest.raises(ValueError, match="needs --fsdp2"):
         validate_fsdp2_args(argparse.Namespace(fsdp2=False, fsdp2_replicas=1, fsdp2_node_local_checkpoints=True))
+    with pytest.raises(ValueError, match="needs --fsdp2"):
+        validate_fsdp2_args(argparse.Namespace(fsdp2=False, fsdp2_replicas=1, fsdp2_replica0_checkpoints=True))
+    with pytest.raises(ValueError, match="pick one"):
+        validate_fsdp2_args(argparse.Namespace(**{**vars(ok), "fsdp2_node_local_checkpoints": True,
+                                                  "fsdp2_replica0_checkpoints": True}))

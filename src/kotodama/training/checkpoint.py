@@ -776,7 +776,11 @@ class ShardedCheckpointManager(CheckpointManager):
     the same string on every node, a different disk). DCP's dedup of replicated shards then never crosses replicas, so
     every node's directory alone restores the run; the group's first rank writes the META file and renames. Resume
     loads the newest step present on every node, over each node's own directory. A node that did not save (e.g. a new
-    one after a world-size change) needs a copy of a checkpoint directory first."""
+    one after a world-size change) needs a copy of a checkpoint directory first.
+
+    Replica-0 checkpoints (``group`` = the shard group, ``writer`` true on replica 0 only): replica 0 saves the complete
+    copy over its group into ``checkpoint_dir`` and is the only one that writes anything; every replica resumes from
+    that same directory. The other nodes then need only read access to it (e.g. a read-only mount of node 0's disk)."""
 
     META = "meta.pt"
 
@@ -786,10 +790,12 @@ class ShardedCheckpointManager(CheckpointManager):
         rank: int = 0,
         keep_last_n: int = 5,
         group: Optional[Any] = None,
+        writer: bool = True,
     ) -> None:
         self.group = group
-        self.leader = (dist.get_rank(group) == 0) if group is not None else rank == 0
-        super().__init__(checkpoint_dir, rank=rank, keep_last_n=keep_last_n)
+        self.writer = writer
+        self.leader = writer and ((dist.get_rank(group) == 0) if group is not None else rank == 0)
+        super().__init__(checkpoint_dir, rank=rank, keep_last_n=keep_last_n)  # rank 0 is always in replica 0
         if self.leader:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -814,9 +820,10 @@ class ShardedCheckpointManager(CheckpointManager):
             shutil.rmtree(tmp)  # an earlier interrupted save of this very step
         _barrier()
         t0 = time.time()
-        raw = _unwrap(model)
-        msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
-        dcp.save({"model": msd, "optim": osd}, checkpoint_id=str(tmp), process_group=self.group)
+        if self.writer:
+            raw = _unwrap(model)
+            msd, osd = get_state_dict(raw, [muon_opt, adamw_opt])
+            dcp.save({"model": msd, "optim": osd}, checkpoint_id=str(tmp), process_group=self.group)
         if self.leader:
             meta: dict[str, Any] = {
                 "step": step,

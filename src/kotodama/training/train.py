@@ -1112,14 +1112,19 @@ def train(args: argparse.Namespace) -> None:
         if getattr(args, "async_checkpoint", False) and is_main:
             logger.warning("--async_checkpoint: FSDP2 saves are synchronous sharded (DCP) checkpoints")
         _node_local = getattr(args, "fsdp2_node_local_checkpoints", False)
+        _replica0 = getattr(args, "fsdp2_replica0_checkpoints", False) and fsdp_mesh.ndim == 2
         ckpt_mgr = ShardedCheckpointManager(
             checkpoint_dir=args.checkpoint_dir,
             rank=rank,
             keep_last_n=args.keep_checkpoints,
-            group=fsdp_mesh["shard"].get_group() if _node_local and fsdp_mesh.ndim == 2 else None,
+            group=fsdp_mesh["shard"].get_group() if (_node_local or _replica0) and fsdp_mesh.ndim == 2 else None,
+            writer=fsdp_mesh["replicate"].get_local_rank() == 0 if _replica0 else True,
         )
         if _node_local and is_main:
             logger.info("Sharded checkpoints are node-local: each node saves a complete copy into %s on its own disk",
+                        args.checkpoint_dir)
+        if _replica0 and is_main:
+            logger.info("Sharded checkpoints are written by replica 0 only, into %s; every replica resumes from it",
                         args.checkpoint_dir)
     elif getattr(args, "async_checkpoint", False):
         ckpt_mgr = AsyncCheckpointManager(
@@ -1844,7 +1849,7 @@ def train(args: argparse.Namespace) -> None:
         # A SIGTERM reaches each rank (and each node) at its own moment. Every stop decision below reads this one
         # agreed value, so all ranks run the same collectives (evals, the stop save, the final save).
         stopping = stopping or any_rank_stopping(
-            sigterm.received or (stop_file is not None and stop_file.exists()), device)
+            sigterm.received or (stop_file is not None and is_main and stop_file.exists()), device)
 
         # -- In-loop evals (weights == checkpoint step_<step>) -------------------
         if inloop is not None and inloop.due(step):
@@ -2296,6 +2301,8 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
             raise ValueError("--fsdp2_replicas needs --fsdp2")
         if getattr(args, "fsdp2_node_local_checkpoints", False):
             raise ValueError("--fsdp2_node_local_checkpoints needs --fsdp2")
+        if getattr(args, "fsdp2_replica0_checkpoints", False):
+            raise ValueError("--fsdp2_replica0_checkpoints needs --fsdp2")
         return
     unsupported = {
         "--tp_size > 1": getattr(args, "tp_size", 1) > 1,
@@ -2309,6 +2316,9 @@ def validate_fsdp2_args(args: argparse.Namespace) -> None:
         raise ValueError("--fsdp2 does not support: " + "; ".join(bad))
     if getattr(args, "fsdp2_replicas", 1) < 1:
         raise ValueError("--fsdp2_replicas must be >= 1")
+    if getattr(args, "fsdp2_node_local_checkpoints", False) and getattr(args, "fsdp2_replica0_checkpoints", False):
+        raise ValueError("--fsdp2_node_local_checkpoints and --fsdp2_replica0_checkpoints are two different layouts; "
+                         "pick one")
     scope = getattr(args, "fsdp2_compile_scope", "unit")
     if scope != "unit" and not getattr(args, "attn_res", True):
         raise ValueError(f"--fsdp2_compile_scope {scope} compiles AttnRes regions; it needs --attn_res")
@@ -2604,8 +2614,9 @@ def parse_args() -> argparse.Namespace:
         help="A path that, once it exists, asks the run to stop like SIGTERM does: at the next step boundary every "
              "rank saves a checkpoint and exits, then rank 0 writes <stop_file>.saved. A scheduler's pre-stop hook "
              "(heimdall --on-preempt) creates the file and waits for the marker, so the stop save never races a "
-             "signal or the launcher's own shutdown timeout (torchrun kills workers 30 s after its SIGTERM). Every "
-             "rank checks it, so under several nodes put it on a filesystem they share. Cleared at startup.",
+             "signal or the launcher's own shutdown timeout (torchrun kills workers 30 s after its SIGTERM). Rank 0 "
+             "checks it and the per-step stop agreement carries the request to every rank, so only rank 0's node "
+             "needs to see it. Cleared at startup.",
     )
     p.add_argument("--keep_checkpoints", type=int, default=5)
     p.add_argument(
@@ -2842,6 +2853,12 @@ def parse_args() -> argparse.Namespace:
         help="With --fsdp2 --fsdp2_replicas > 1: each node (replica) saves a complete sharded checkpoint into "
              "--checkpoint_dir on its own disk (a node-local path, the same on every node), and resume reads each "
              "node's own copy; without it the checkpoint dir must be one filesystem every rank sees.",
+    )
+    p.add_argument(
+        "--fsdp2_replica0_checkpoints", action="store_true",
+        help="With --fsdp2 --fsdp2_replicas > 1: only replica 0 (node 0) writes, a complete sharded checkpoint into "
+             "--checkpoint_dir over its own ranks, and every replica resumes from that same directory; the other "
+             "nodes need only read access to it (e.g. a read-only mount of node 0's disk).",
     )
     p.add_argument(
         "--fsdp2_defer_grad_sync", action="store_true",
