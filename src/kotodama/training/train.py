@@ -61,7 +61,7 @@ from kotodama import presets
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from kotodama.monitoring.wandb_callback import WandbLogger
-from kotodama.training.balance import rebalance_batch
+from kotodama.training.balance import rebalance_step
 from kotodama.training.checkpoint import (
     AsyncCheckpointManager,
     CheckpointManager,
@@ -1477,7 +1477,7 @@ def train(args: argparse.Namespace) -> None:
     _fsdp2_defer = bool(getattr(args, "fsdp2_defer_grad_sync", False))
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
-    _balance_stats: dict[str, float] = {}  # the last micro-step's deal (--balance_windows), logged with the step
+    _balance_stats: dict[str, float] = {}  # the last step's deal (--balance_windows), logged with the step
 
     for step in range(start_step, loop_end):
         # Start profiler at the configured step
@@ -1505,25 +1505,30 @@ def train(args: argparse.Namespace) -> None:
 
         if micro_stats is not None:
             micro_stats.begin(current_grad_accum)
-        for micro_step in range(current_grad_accum):
+        def _fetch(micro: int) -> Any:
+            nonlocal data_iter, log_data_wait
             _t_data = time.perf_counter()
             try:
-                batch = next(data_iter)
+                b = next(data_iter)
             except StopIteration:
                 data_iter = _make_data_iter()
-                batch = next(data_iter)
+                b = next(data_iter)
             log_data_wait += time.perf_counter() - _t_data
-
             if step - start_step < _guard_steps or step < _debug_hash_steps:
-                _ids = batch["input_ids"] if isinstance(batch, dict) else batch
-                _digests = check_rank_batches_distinct(_ids, dp_group, device, step=step, micro=micro_step)
+                _ids = b["input_ids"] if isinstance(b, dict) else b
+                _digests = check_rank_batches_distinct(_ids, dp_group, device, step=step, micro=micro)
                 if is_main and step < _debug_hash_steps:
                     logger.info("batch-hash step=%d micro=%d shape=%s digests=%s",
-                                step, micro_step, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
+                                step, micro, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
+            return b
 
-            if balance_windows:
-                batch = rebalance_batch(batch, seq_len, device, dp_group, eos_id=getattr(dataset, "eos_id", 0),
-                                        stats=_balance_stats)
+        # --balance_windows: the whole step's windows are read up front (each rank's own, as without it; the batch
+        # digests above are of those) and dealt across ranks and micro-steps by attention cost.
+        _step_batches = (rebalance_step([_fetch(m) for m in range(current_grad_accum)], seq_len, device, dp_group,
+                                        eos_id=getattr(dataset, "eos_id", 0), stats=_balance_stats)
+                         if balance_windows else None)
+        for micro_step in range(current_grad_accum):
+            batch = _step_batches[micro_step] if _step_batches is not None else _fetch(micro_step)
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -2571,9 +2576,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--balance_windows", action="store_true",
-        help="With --doc_masking and several data-parallel ranks: every micro-step, the ranks pool their windows and "
-             "deal them out again so each rank's attention cost (sum of squared document lengths) is level; every "
-             "rank keeps micro_batch windows and the step trains the same windows (kotodama.training.balance).",
+        help="With --doc_masking and several data-parallel ranks: every optimizer step, the ranks pool the step's "
+             "windows (all ranks, all micro-steps) and deal them out again so cost-alike windows share a micro-step "
+             "and each micro-step's attention cost (sum of squared document lengths) is level across ranks; every "
+             "rank keeps micro_batch windows per micro-step and the step trains the same windows "
+             "(kotodama.training.balance).",
     )
     p.add_argument(
         "--doc_masking",
