@@ -1872,6 +1872,11 @@ def train(args: argparse.Namespace) -> None:
                     logger.info("Stop request — exiting, checkpoint skipped (save_every<=0)")
                 mark_stop_saved(stop_file, is_main)
                 break
+            if should_save:  # this step's periodic save already holds it (the same on every rank)
+                if is_main:
+                    logger.info("Stop request — exiting; step %d was just saved", step)
+                mark_stop_saved(stop_file, is_main)
+                break
             if is_main:
                 logger.info("Stop request — saving checkpoint at step %d", step)
             data_state = _current_data_state()
