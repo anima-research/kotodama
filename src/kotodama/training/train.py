@@ -61,6 +61,7 @@ from kotodama import presets
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from kotodama.monitoring.wandb_callback import WandbLogger
+from kotodama.training.balance import rebalance_batch
 from kotodama.training.checkpoint import (
     AsyncCheckpointManager,
     CheckpointManager,
@@ -1042,6 +1043,9 @@ def train(args: argparse.Namespace) -> None:
     if apply_attnres_stack_grad_chain(args) and is_main:
         logger.info("AttnRes stack-gradient chain ON: routes sharing a committed stack sum its gradient in-kernel")
     doc_masking = getattr(args, "doc_masking", False)
+    balance_windows = bool(getattr(args, "balance_windows", False))
+    if balance_windows and not doc_masking:
+        raise ValueError("--balance_windows deals document-masked windows; it needs --doc_masking")
     varlen_dynamic = bool(getattr(args, "varlen_dynamic", False) and args.compile and doc_masking)
     if is_main and getattr(args, "varlen_dynamic", False) and not varlen_dynamic:
         logger.warning("--varlen_dynamic ignored: it needs --compile and --doc_masking")
@@ -1473,6 +1477,7 @@ def train(args: argparse.Namespace) -> None:
     _fsdp2_defer = bool(getattr(args, "fsdp2_defer_grad_sync", False))
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
+    _balance_stats: dict[str, float] = {}  # the last micro-step's deal (--balance_windows), logged with the step
 
     for step in range(start_step, loop_end):
         # Start profiler at the configured step
@@ -1515,6 +1520,10 @@ def train(args: argparse.Namespace) -> None:
                 if is_main and step < _debug_hash_steps:
                     logger.info("batch-hash step=%d micro=%d shape=%s digests=%s",
                                 step, micro_step, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
+
+            if balance_windows:
+                batch = rebalance_batch(batch, seq_len, device, dp_group, eos_id=getattr(dataset, "eos_id", 0),
+                                        stats=_balance_stats)
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -1768,6 +1777,7 @@ def train(args: argparse.Namespace) -> None:
                        "train/grad_norm_max": _gn_max_s,
                        "train/grad_clip_frac": _gn_clip_s / max(log_steps, 1),
                        "train/z_loss": avg_z_loss,
+                       **_balance_stats,
                        **(_micro_summary(_micro_rec) if _micro_rec is not None else {}),
                        "train/muon_lr": lrs["muon_lr"],
                        "train/adamw_lr": lrs["adamw_lr"],
@@ -2558,6 +2568,12 @@ def parse_args() -> argparse.Namespace:
         "--random_data",
         action="store_true",
         help="Use random tokens (for testing)",
+    )
+    p.add_argument(
+        "--balance_windows", action="store_true",
+        help="With --doc_masking and several data-parallel ranks: every micro-step, the ranks pool their windows and "
+             "deal them out again so each rank's attention cost (sum of squared document lengths) is level; every "
+             "rank keeps micro_batch windows and the step trains the same windows (kotodama.training.balance).",
     )
     p.add_argument(
         "--doc_masking",
