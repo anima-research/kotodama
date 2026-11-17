@@ -17,11 +17,17 @@
 #   CONTROL_DIR  where STOP and STOP.saved live; every node must read and write it coherently (default OUT, which
 #                fits one node only)
 #   NODE_LOG_DIR where node k > 0 writes train.node<k>.log (default OUT); node 0 logs to OUT/train.log
+#   KOTODAMA_MXFP8_VENV  the venv both arms run in (default <data root>/venv-mxfp8: a torchao build with the CUDA
+#                mxfp8 cast kernels; both arms share it so the number format is the only difference)
 set -euo pipefail
 ARM="$1"; OUT="$2"; DATA="$3"; STEPS="$4"; STOP_AFTER="$5"; shift 5
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 NNODES="${NNODES:-1}"; NODE_RANK="${NODE_RANK:-0}"
 CONTROL_DIR="${CONTROL_DIR:-$OUT}"
+[ -f "$ROOT/site.env" ] && source "$ROOT/site.env"
+MXVENV="${KOTODAMA_MXFP8_VENV:-${KOTODAMA_DATA_ROOT:-}/venv-mxfp8}"
+if [ ! -x "$MXVENV/bin/python" ]; then echo "no mxfp8 venv at $MXVENV (set KOTODAMA_MXFP8_VENV)" >&2; exit 2; fi
+export KOTODAMA_VENV="$MXVENV"
 if [ "$NODE_RANK" = 0 ]; then
   mkdir -p "$OUT" "$CONTROL_DIR"
   LOG="$OUT/train.log"
@@ -49,7 +55,7 @@ FLAGS=(--config "$ROOT/configs/tsumugi-1b.yaml" --model_size 10b-bench-spire --a
        --geo_monitor --inloop_evals riders,induction
        --checkpoint_dir "$OUT" --save_every "${SAVE_EVERY:-100}" --keep_checkpoints 1 --save_schedule '' --anchor_tokens ''
        --stop_file "$CONTROL_DIR/STOP" "${PREC[@]}" "$@")
-echo "fsdp2-rehearsal arm=$ARM nodes=$NNODES node=$NODE_RANK steps=$STEPS stop_after_min=$STOP_AFTER" | tee -a "$LOG"
+echo "fsdp2-rehearsal arm=$ARM nodes=$NNODES node=$NODE_RANK steps=$STEPS stop_after_min=$STOP_AFTER venv=$KOTODAMA_VENV" | tee -a "$LOG"
 
 run() { "$ROOT/tools/run_train.sh" "${FLAGS[@]}" 2>&1 | tee -a "$LOG"; }
 
