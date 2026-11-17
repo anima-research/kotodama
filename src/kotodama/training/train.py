@@ -1450,6 +1450,9 @@ def train(args: argparse.Namespace) -> None:
     step_t0 = time.time()
     log_loss_accum = 0.0
     log_loss_rank0_accum = 0.0
+    if is_main:
+        logger.info("Logged loss = the step loss averaged over all %d ranks (the whole batch); loss_rank0 = rank 0's "
+                    "share alone (what train/loss meant before the all-rank mean)", world_size)
     log_z_loss_accum = 0.0
     log_steps = 0
     log_data_wait = 0.0
@@ -1712,12 +1715,13 @@ def train(args: argparse.Namespace) -> None:
             data_wait_per_step = log_data_wait / max(log_steps, 1)
 
             logger.info(
-                "step=%d/%d | loss=%.4f | z_loss=%.6f | grad_norm=%.3f | "
+                "step=%d/%d | loss=%.4f | loss_rank0=%.4f | z_loss=%.6f | grad_norm=%.3f | "
                 "muon_lr=%.6f | adamw_lr=%.6f | tok/s=%.0f | it/s=%.2f | "
                 "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB",
                 step,
                 total_steps,
                 avg_loss,
+                log_loss_rank0_accum / max(log_steps, 1),
                 avg_z_loss,
                 _grad_norm_scalar,
                 lrs["muon_lr"],
@@ -2692,7 +2696,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Logging
-    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument(
+        "--log_every", type=int, default=10,
+        help="Steps per logged point. loss (the log line and train/loss) is the step loss averaged over every rank, "
+             "i.e. the whole batch; loss_rank0 (train/loss_rank0) is rank 0's share alone, which is what train/loss "
+             "meant in runs before the all-rank mean: compare an older run's train/loss to a newer one's "
+             "train/loss_rank0.",
+    )
     p.add_argument(
         "--peak_tflops_per_gpu", type=float, default=2250.0,
         help="Per-GPU peak TFLOPs for MFU reporting (default: 2250 = B200 dense BF16). "
