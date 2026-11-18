@@ -169,6 +169,31 @@ def data_parallel_rank(rank: int, dp_group: Any) -> int:
     return rank
 
 
+class GcTimer:
+    """Counts and times the cyclic garbage collector's passes by generation (a ``gc.callbacks`` hook): a full
+    (generation 2) pass rescans every tracked object, so a large long-lived object graph turns into periodic stalls.
+    :meth:`take` returns the totals since the last call as ``gc/gen{0,1,2}_{count,ms}`` and resets them."""
+
+    def __init__(self) -> None:
+        self._t0: Optional[float] = None
+        self.count = [0, 0, 0]
+        self.ms = [0.0, 0.0, 0.0]
+
+    def __call__(self, phase: str, info: dict[str, Any]) -> None:
+        if phase == "start":
+            self._t0 = time.perf_counter()
+        elif self._t0 is not None:
+            g = min(int(info.get("generation", 2)), 2)
+            self.count[g] += 1
+            self.ms[g] += (time.perf_counter() - self._t0) * 1e3
+            self._t0 = None
+
+    def take(self) -> dict[str, float]:
+        out = {f"gc/gen{g}_{k}": float(v[g]) for g in range(3) for k, v in (("count", self.count), ("ms", self.ms))}
+        self.count, self.ms = [0, 0, 0], [0.0, 0.0, 0.0]
+        return out
+
+
 def batch_digest(ids: torch.Tensor) -> int:
     """64-bit digest (signed) of a micro-batch's token ids."""
     raw = ids.detach().cpu().contiguous().numpy().tobytes()
@@ -1475,6 +1500,8 @@ def train(args: argparse.Namespace) -> None:
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
 
+    _gc_timer = GcTimer()
+    gc.callbacks.append(_gc_timer)
     if getattr(args, "gc_freeze", False):
         # Setup's long-lived objects (in-loop eval suites, probe batches, the data index) would otherwise be rescanned
         # by every full garbage collection during training; freezing moves them out of the collector's view.
@@ -1720,13 +1747,14 @@ def train(args: argparse.Namespace) -> None:
             lrs = scheduler.get_last_lr()
             gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
             _grad_norm_scalar = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            _gc_stats = _gc_timer.take()  # gc passes since the last logged step
             mfu = flops_per_token * tokens_per_sec / peak_flops_total
             data_wait_per_step = log_data_wait / max(log_steps, 1)
 
             logger.info(
                 "step=%d/%d | loss=%.4f | loss_rank0=%.4f | z_loss=%.6f | grad_norm=%.3f | "
                 "muon_lr=%.6f | adamw_lr=%.6f | tok/s=%.0f | it/s=%.2f | "
-                "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB",
+                "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB | gc2=%d/%.0fms",
                 step,
                 total_steps,
                 avg_loss,
@@ -1741,6 +1769,8 @@ def train(args: argparse.Namespace) -> None:
                 data_wait_per_step,
                 tokens_consumed / 1e9,
                 gpu_mem,
+                int(_gc_stats["gc/gen2_count"]),
+                _gc_stats["gc/gen2_ms"],
             )
             if _time_opt:
                 logger.info("  opt_step=%.4fs (%.2f%% of the mean step %.3fs)", _opt_step_s,
@@ -1777,6 +1807,7 @@ def train(args: argparse.Namespace) -> None:
                        "train/grad_norm_max": _gn_max_s,
                        "train/grad_clip_frac": _gn_clip_s / max(log_steps, 1),
                        "train/z_loss": avg_z_loss,
+                       **_gc_stats,
                        **(_micro_summary(_micro_rec) if _micro_rec is not None else {}),
                        "train/muon_lr": lrs["muon_lr"],
                        "train/adamw_lr": lrs["adamw_lr"],
