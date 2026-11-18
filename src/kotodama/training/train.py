@@ -1502,6 +1502,14 @@ def train(args: argparse.Namespace) -> None:
 
     _gc_timer = GcTimer()
     gc.callbacks.append(_gc_timer)
+    _manual_gc = int(getattr(args, "manual_gc_interval", 0) or 0)
+    if _manual_gc > 0:
+        # Automatic collections run on each rank's own schedule; in a multi-rank step every collective then waits for
+        # whichever rank is mid-collection. Collect on every rank together instead, every N steps.
+        gc.disable()
+        if is_main:
+            logger.info("Manual garbage collection: automatic off, a full collection every %d steps on every rank",
+                        _manual_gc)
     if getattr(args, "gc_freeze", False):
         # Setup's long-lived objects (in-loop eval suites, probe batches, the data index) would otherwise be rescanned
         # by every full garbage collection during training; freezing moves them out of the collector's view.
@@ -1721,6 +1729,8 @@ def train(args: argparse.Namespace) -> None:
             _opt_step_s = time.perf_counter() - _t_opt
         muon_opt.zero_grad(set_to_none=True)
         adamw_opt.zero_grad(set_to_none=True)
+        if _manual_gc and (step + 1) % _manual_gc == 0:
+            gc.collect()  # every rank at the same step boundary, so no rank's collection stalls the others mid-step
 
         # Track tokens (use current_grad_accum for accurate counting)
         current_tokens_per_step = current_grad_accum * tokens_per_global_micro
@@ -2598,6 +2608,12 @@ def parse_args() -> argparse.Namespace:
         "--random_data",
         action="store_true",
         help="Use random tokens (for testing)",
+    )
+    p.add_argument(
+        "--manual_gc_interval", type=int, default=0,
+        help="N > 0: turn the automatic garbage collector off and run a full collection on every rank at the same "
+             "step boundary every N steps, so one rank's collection never stalls the others' collectives mid-step "
+             "(gc/gen2_* in the telemetry show the passes).",
     )
     p.add_argument(
         "--gc_freeze", action="store_true",
