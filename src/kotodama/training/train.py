@@ -23,6 +23,7 @@ FSDP sharding complications.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import itertools
 import json
@@ -1474,6 +1475,14 @@ def train(args: argparse.Namespace) -> None:
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
 
+    if getattr(args, "gc_freeze", False):
+        # Setup's long-lived objects (in-loop eval suites, probe batches, the data index) would otherwise be rescanned
+        # by every full garbage collection during training; freezing moves them out of the collector's view.
+        gc.collect()
+        gc.freeze()
+        if is_main:
+            logger.info("gc.freeze(): %d setup objects moved out of the collector's view", gc.get_freeze_count())
+
     for step in range(start_step, loop_end):
         # Start profiler at the configured step
         if _profiler is None and is_main and step == getattr(args, "profile_start_step", -1) and getattr(args, "profile", False):
@@ -2558,6 +2567,12 @@ def parse_args() -> argparse.Namespace:
         "--random_data",
         action="store_true",
         help="Use random tokens (for testing)",
+    )
+    p.add_argument(
+        "--gc_freeze", action="store_true",
+        help="Before the first step, collect garbage once and freeze every object alive then (gc.freeze), so full "
+             "garbage collections during training skip setup's long-lived objects (in-loop eval suites, probe "
+             "batches, the data index).",
     )
     p.add_argument(
         "--doc_masking",
