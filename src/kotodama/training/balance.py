@@ -88,7 +88,8 @@ def rebalance_step(batches: list[dict[str, Any]], seq_len: int, device: torch.de
     """This rank's micro-batches for one optimizer step after the cost-levelling deal (see the module docstring).
     ``batches`` are the step's :func:`collate_packed` micro-batches, each of whole windows of ``seq_len`` tokens; the
     result is as many micro-batches of the same size, on the CPU like the input. ``stats``, when given, receives
-    :func:`step_wait_ratio` before and after the deal (``balance/step_wait_ratio_{before,after}``). Collective over
+    :func:`step_wait_ratio` before and after the deal (``balance/step_wait_ratio_{before,after}``) and the share of
+    windows that changed rank or micro-step (``balance/windows_moved_frac``). Collective over
     ``group`` (the data-parallel ranks); a no-op on one rank."""
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size(group) < 2:
         return batches
@@ -118,6 +119,9 @@ def rebalance_step(batches: list[dict[str, Any]], seq_len: int, device: torch.de
                      for m in range(n_micro)] for r in range(world)]
         stats["balance/step_wait_ratio_before"] = step_wait_ratio(pooled_costs, identity)
         stats["balance/step_wait_ratio_after"] = step_wait_ratio(pooled_costs, plan)
+        where = {g: (r, m) for r in range(world) for m in range(n_micro) for g in plan[r][m]}
+        moved = sum(1 for g, (r, m) in where.items() if (g // n_local, (g % n_local) // per_micro) != (r, m))
+        stats["balance/windows_moved_frac"] = moved / len(pooled_costs)
 
     local_dev = windows.to(device=device, dtype=torch.int32)
     all_ids = [torch.empty_like(local_dev) for _ in range(world)]

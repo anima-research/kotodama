@@ -1527,8 +1527,11 @@ def train(args: argparse.Namespace) -> None:
         _step_batches = (rebalance_step([_fetch(m) for m in range(current_grad_accum)], seq_len, device, dp_group,
                                         eos_id=getattr(dataset, "eos_id", 0), stats=_balance_stats)
                          if balance_windows else None)
+        _trained: list[int] = []  # digests of the windows this rank trains this step (KOTODAMA_DEBUG_BATCH_HASH)
         for micro_step in range(current_grad_accum):
             batch = _step_batches[micro_step] if _step_batches is not None else _fetch(micro_step)
+            if step < _debug_hash_steps and isinstance(batch, dict):
+                _trained.extend(batch_digest(w) for w in batch["input_ids"].reshape(-1, seq_len))
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -1588,6 +1591,19 @@ def train(args: argparse.Namespace) -> None:
             _loss_accum += output["loss"].detach()
             if "z_loss" in output:
                 _z_loss_accum += output["z_loss"].detach()
+
+        if step < _debug_hash_steps and _trained:
+            # The multiset of windows the whole step trained (every rank, every micro-step): equal across runs with
+            # the same data seed whatever the deal (--balance_windows only moves windows between ranks/micro-steps).
+            _pool: list[Any] = [_trained]
+            if dist.is_initialized() and dist.get_world_size(dp_group) > 1:
+                _pool = [None] * dist.get_world_size(dp_group)
+                dist.all_gather_object(_pool, _trained, group=dp_group)
+            if is_main:
+                _flat = sorted(h for part in _pool for h in part)
+                logger.info("step-multiset step=%d windows=%d digest=%016x moved=%.2f", step, len(_flat),
+                            batch_digest(torch.tensor(_flat, dtype=torch.int64)) & (2**64 - 1),
+                            _balance_stats.get("balance/windows_moved_frac", 0.0))
 
         # Single GPU→CPU sync after all micro-steps
         step_loss_rank0 = _loss_accum.item() / current_grad_accum  # this rank's share (rank 0's is logged too)

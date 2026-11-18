@@ -89,6 +89,7 @@ def _rebalance_worker(rank: int, world: int, init_file: str, out_dir: str) -> No
     a = rebalance_step(step, SEQ, torch.device("cpu"), stats=stats)
     b = rebalance_step(step, SEQ, torch.device("cpu"))
     assert 1.0 <= stats["balance/step_wait_ratio_after"] <= stats["balance/step_wait_ratio_before"]
+    assert 0.0 <= stats["balance/windows_moved_frac"] <= 1.0
     assert len(a) == N_MICRO
     rows = []
     for x, y in zip(a, b):
