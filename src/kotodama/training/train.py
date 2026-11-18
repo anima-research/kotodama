@@ -1510,14 +1510,6 @@ def train(args: argparse.Namespace) -> None:
         if is_main:
             logger.info("Manual garbage collection: automatic off, a full collection every %d steps on every rank",
                         _manual_gc)
-    if getattr(args, "gc_freeze", False):
-        # Setup's long-lived objects (in-loop eval suites, probe batches, the data index) would otherwise be rescanned
-        # by every full garbage collection during training; freezing moves them out of the collector's view.
-        gc.collect()
-        gc.freeze()
-        if is_main:
-            logger.info("gc.freeze(): %d setup objects moved out of the collector's view", gc.get_freeze_count())
-
     for step in range(start_step, loop_end):
         # Start profiler at the configured step
         if _profiler is None and is_main and step == getattr(args, "profile_start_step", -1) and getattr(args, "profile", False):
@@ -2614,12 +2606,6 @@ def parse_args() -> argparse.Namespace:
         help="N > 0: turn the automatic garbage collector off and run a full collection on every rank at the same "
              "step boundary every N steps, so one rank's collection never stalls the others' collectives mid-step "
              "(gc/gen2_* in the telemetry show the passes).",
-    )
-    p.add_argument(
-        "--gc_freeze", action="store_true",
-        help="Before the first step, collect garbage once and freeze every object alive then (gc.freeze), so full "
-             "garbage collections during training skip setup's long-lived objects (in-loop eval suites, probe "
-             "batches, the data index).",
     )
     p.add_argument(
         "--doc_masking",
