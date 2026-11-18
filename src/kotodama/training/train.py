@@ -1778,6 +1778,7 @@ def train(args: argparse.Namespace) -> None:
             iters_per_sec = log_steps / max(elapsed, 1e-6)
             lrs = scheduler.get_last_lr()
             gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
+            gpu_reserved = torch.cuda.memory_reserved(device) / 1e9  # what the caching allocator holds right now
             _grad_norm_scalar = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             _gc_stats = _gc_timer.take()  # gc passes since the last logged step
             mfu = flops_per_token * tokens_per_sec / peak_flops_total
@@ -1786,7 +1787,7 @@ def train(args: argparse.Namespace) -> None:
             logger.info(
                 "step=%d/%d | loss=%.4f | loss_rank0=%.4f | z_loss=%.6f | grad_norm=%.3f | "
                 "muon_lr=%.6f | adamw_lr=%.6f | tok/s=%.0f | it/s=%.2f | "
-                "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB | gc2=%d/%.0fms",
+                "mfu=%.1f%% | data_wait=%.3fs | tokens=%.3fB | gpu_mem=%.1fGB | reserved=%.1fGB | gc2=%d/%.0fms",
                 step,
                 total_steps,
                 avg_loss,
@@ -1801,6 +1802,7 @@ def train(args: argparse.Namespace) -> None:
                 data_wait_per_step,
                 tokens_consumed / 1e9,
                 gpu_mem,
+                gpu_reserved,
                 int(_gc_stats["gc/gen2_count"]),
                 _gc_stats["gc/gen2_ms"],
             )
@@ -1850,6 +1852,7 @@ def train(args: argparse.Namespace) -> None:
                        "perf/step_time_s": elapsed / max(log_steps, 1),
                        "perf/data_wait_s_per_step": data_wait_per_step,
                        "perf/gpu_mem_gb": gpu_mem,
+                       "perf/gpu_reserved_gb": gpu_reserved,
                        "perf/mfu": mfu,
                        **({"perf/opt_step_s": _opt_step_s} if _time_opt else {})},
                 )
