@@ -62,6 +62,7 @@ from kotodama import presets
 from kotodama.model.llama import KotodamaModel, KotodamaModelConfig
 from kotodama.monitoring.geometric import GeometricMonitor, MonitorConfig, MonitorSchedule
 from kotodama.monitoring.wandb_callback import WandbLogger
+from kotodama.training.balance import rebalance_step
 from kotodama.training.checkpoint import (
     AsyncCheckpointManager,
     CheckpointManager,
@@ -1068,6 +1069,9 @@ def train(args: argparse.Namespace) -> None:
     if apply_attnres_stack_grad_chain(args) and is_main:
         logger.info("AttnRes stack-gradient chain ON: routes sharing a committed stack sum its gradient in-kernel")
     doc_masking = getattr(args, "doc_masking", False)
+    balance_windows = bool(getattr(args, "balance_windows", False))
+    if balance_windows and not doc_masking:
+        raise ValueError("--balance_windows deals document-masked windows; it needs --doc_masking")
     varlen_dynamic = bool(getattr(args, "varlen_dynamic", False) and args.compile and doc_masking)
     if is_main and getattr(args, "varlen_dynamic", False) and not varlen_dynamic:
         logger.warning("--varlen_dynamic ignored: it needs --compile and --doc_masking")
@@ -1499,6 +1503,7 @@ def train(args: argparse.Namespace) -> None:
     _fsdp2_defer = bool(getattr(args, "fsdp2_defer_grad_sync", False))
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
+    _balance_stats: dict[str, float] = {}  # the last step's deal (--balance_windows), logged with the step
 
     _gc_timer = GcTimer()
     gc.callbacks.append(_gc_timer)
@@ -1536,21 +1541,33 @@ def train(args: argparse.Namespace) -> None:
 
         if micro_stats is not None:
             micro_stats.begin(current_grad_accum)
-        for micro_step in range(current_grad_accum):
+        def _fetch(micro: int) -> Any:
+            nonlocal data_iter, log_data_wait
             _t_data = time.perf_counter()
             try:
-                batch = next(data_iter)
+                b = next(data_iter)
             except StopIteration:
                 data_iter = _make_data_iter()
-                batch = next(data_iter)
+                b = next(data_iter)
             log_data_wait += time.perf_counter() - _t_data
-
             if step - start_step < _guard_steps or step < _debug_hash_steps:
-                _ids = batch["input_ids"] if isinstance(batch, dict) else batch
-                _digests = check_rank_batches_distinct(_ids, dp_group, device, step=step, micro=micro_step)
+                _ids = b["input_ids"] if isinstance(b, dict) else b
+                _digests = check_rank_batches_distinct(_ids, dp_group, device, step=step, micro=micro)
                 if is_main and step < _debug_hash_steps:
                     logger.info("batch-hash step=%d micro=%d shape=%s digests=%s",
-                                step, micro_step, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
+                                step, micro, tuple(_ids.shape), ",".join(f"{d:016x}" for d in _digests))
+            return b
+
+        # --balance_windows: the whole step's windows are read up front (each rank's own, as without it; the batch
+        # digests above are of those) and dealt across ranks and micro-steps by attention cost.
+        _step_batches = (rebalance_step([_fetch(m) for m in range(current_grad_accum)], seq_len, device, dp_group,
+                                        eos_id=getattr(dataset, "eos_id", 0), stats=_balance_stats)
+                         if balance_windows else None)
+        _trained: list[int] = []  # digests of the windows this rank trains this step (KOTODAMA_DEBUG_BATCH_HASH)
+        for micro_step in range(current_grad_accum):
+            batch = _step_batches[micro_step] if _step_batches is not None else _fetch(micro_step)
+            if step < _debug_hash_steps and isinstance(batch, dict):
+                _trained.extend(batch_digest(w) for w in batch["input_ids"].reshape(-1, seq_len))
 
             # Unpack: doc_masking yields dict, legacy yields tensor
             if doc_masking:
@@ -1610,6 +1627,19 @@ def train(args: argparse.Namespace) -> None:
             _loss_accum += output["loss"].detach()
             if "z_loss" in output:
                 _z_loss_accum += output["z_loss"].detach()
+
+        if step < _debug_hash_steps and _trained:
+            # The multiset of windows the whole step trained (every rank, every micro-step): equal across runs with
+            # the same data seed whatever the deal (--balance_windows only moves windows between ranks/micro-steps).
+            _pool: list[Any] = [_trained]
+            if dist.is_initialized() and dist.get_world_size(dp_group) > 1:
+                _pool = [None] * dist.get_world_size(dp_group)
+                dist.all_gather_object(_pool, _trained, group=dp_group)
+            if is_main:
+                _flat = sorted(h for part in _pool for h in part)
+                logger.info("step-multiset step=%d windows=%d digest=%016x moved=%.2f", step, len(_flat),
+                            batch_digest(torch.tensor(_flat, dtype=torch.int64)) & (2**64 - 1),
+                            _balance_stats.get("balance/windows_moved_frac", 0.0))
 
         # Single GPU→CPU sync after all micro-steps
         step_loss_rank0 = _loss_accum.item() / current_grad_accum  # this rank's share (rank 0's is logged too)
@@ -1810,6 +1840,7 @@ def train(args: argparse.Namespace) -> None:
                        "train/grad_clip_frac": _gn_clip_s / max(log_steps, 1),
                        "train/z_loss": avg_z_loss,
                        **_gc_stats,
+                       **_balance_stats,
                        **(_micro_summary(_micro_rec) if _micro_rec is not None else {}),
                        "train/muon_lr": lrs["muon_lr"],
                        "train/adamw_lr": lrs["adamw_lr"],
@@ -2606,6 +2637,14 @@ def parse_args() -> argparse.Namespace:
         help="N > 0: turn the automatic garbage collector off and run a full collection on every rank at the same "
              "step boundary every N steps, so one rank's collection never stalls the others' collectives mid-step "
              "(gc/gen2_* in the telemetry show the passes).",
+    )
+    p.add_argument(
+        "--balance_windows", action="store_true",
+        help="With --doc_masking and several data-parallel ranks: every optimizer step, the ranks pool the step's "
+             "windows (all ranks, all micro-steps) and deal them out again so cost-alike windows share a micro-step "
+             "and each micro-step's attention cost (sum of squared document lengths) is level across ranks; every "
+             "rank keeps micro_batch windows per micro-step and the step trains the same windows "
+             "(kotodama.training.balance).",
     )
     p.add_argument(
         "--doc_masking",
