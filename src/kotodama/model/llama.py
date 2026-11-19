@@ -1000,6 +1000,8 @@ class TransformerBlock(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         block_mask=None,
+        energy_attn: Optional[tuple] = None,
+        energy_mlp: Optional[tuple] = None,
         attn_fn: Optional[Callable[..., torch.Tensor]] = None,
         ffn_fn: Optional[Callable[..., torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -1010,16 +1012,21 @@ class TransformerBlock(nn.Module):
 
         ``attn_fn`` / ``ffn_fn`` replace ``self.attn`` / ``self.ffn`` as the callables applied to the normed input
         (same signatures). A wrapper that must not run the modules' ``__call__`` inside a compiled region (FSDP2's
-        hooks on a unit that holds attn + ffn) passes their class forwards bound to the modules."""
+        hooks on a unit that holds attn + ffn) passes their class forwards bound to the modules.
+
+        ``energy_attn`` / ``energy_mlp`` are the two sites' energy-routing tuples (KotodamaModel._energy_for), None
+        without energy routing."""
         attn_fn = self.attn if attn_fn is None else attn_fn
         ffn_fn = self.ffn if ffn_fn is None else ffn_fn
         n = committed_stack.shape[0]
         if h_attn is None:
-            h_attn, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.attn_res_query, self.attn_res_norm)
+            h_attn, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.attn_res_query, self.attn_res_norm,
+                                                 energy=energy_attn)
         partial = partial + attn_fn(
             self.attn_norm(h_attn), rope_cos, rope_sin, mask,
             position_ids=position_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, block_mask=block_mask)
-        h_mlp, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.mlp_res_query, self.mlp_res_norm)
+        h_mlp, _ = KotodamaModel._route_p12(committed_stack, n, partial, self.mlp_res_query, self.mlp_res_norm,
+                                            energy=energy_mlp)
         return partial + ffn_fn(self.ffn_norm(h_mlp))
 
 
@@ -1535,10 +1542,13 @@ class KotodamaModel(nn.Module):
                     region = layer_region(n_committed, i == block_start)
                     args = (lyr, committed_stack, partial, h_attn if i == block_start else None, rope_cos, rope_sin,
                             mask, position_ids, cu_seqlens, max_seqlen, block_mask)
+                    # Energy tuples go by keyword: FSDP2's wrapper passes keywords straight to the region, outside
+                    # its pre-forward input cast.
+                    kw = {"energy_attn": self._energy_for(lyr, "attn"), "energy_mlp": self._energy_for(lyr, "mlp")}
                     if use_ac:
-                        partial = torch_checkpoint(region, *args, use_reentrant=False, preserve_rng_state=False)
+                        partial = torch_checkpoint(region, *args, **kw, use_reentrant=False, preserve_rng_state=False)
                     else:
-                        partial = region(*args)
+                        partial = region(*args, **kw)
                     continue
 
                 # Pre-attention routing (boundary layer already routed above)

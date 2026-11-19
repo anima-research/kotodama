@@ -341,10 +341,11 @@ def compile_fsdp_layers(model: nn.Module, **compile_kwargs: Any) -> None:
     def fsdp_region(n_committed: int, boundary: bool) -> Any:
         region = regions(n_committed, boundary)
 
-        def body(layer: nn.Module, *args: Any) -> torch.Tensor:
-            return region(layer, *args, attn_fn=layer.attn._kotodama_body, ffn_fn=layer.ffn._kotodama_body)
-
-        def run(layer: nn.Module, *args: Any) -> torch.Tensor:
+        def run(layer: nn.Module, *args: Any, **kwargs: Any) -> torch.Tensor:
+            # Keyword arguments (the energy-routing tuples) reach the region directly, outside the group's
+            # pre-forward input cast; the positional ones go through it as before.
+            def body(lyr: nn.Module, *a: Any) -> torch.Tensor:
+                return region(lyr, *a, attn_fn=lyr.attn._kotodama_body, ffn_fn=lyr.ffn._kotodama_body, **kwargs)
             return _group_call(layer.attn, (layer.attn, layer.ffn), body, layer, *args)
         return run
 

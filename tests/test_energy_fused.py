@@ -123,3 +123,28 @@ def test_fused_runs_under_torch_compile():
     assert torch.equal(eager, comp)
     comp.float().sum().backward()
     assert all(x.grad is not None and torch.isfinite(x.grad.float()).all() for x in leaves)
+
+
+def test_layer_scope_regions_route_with_energy():
+    """compile_regions(scope="layer") (and FSDP2's layer scope, which runs the same regions) routes every site with
+    energy: same loss and same energy/query gradients as the eager per-sublayer path, and U receives a gradient
+    (a region that dropped the energy tuple would route with the plain router and leave U without one)."""
+    ids = torch.randint(3, 199, (2, 24), generator=torch.Generator().manual_seed(3))
+
+    def run(regions: bool):
+        m = _model("torch").train()
+        if regions:
+            m.compile_regions(scope="layer")
+        loss = m(ids, labels=ids)["loss"]
+        loss.backward()
+        grads = {n: p.grad.detach().clone() for n, p in m.named_parameters()
+                 if p.grad is not None and ("energy" in n or "res_query" in n)}
+        return loss.detach(), grads
+
+    l_eager, g_eager = run(False)
+    l_region, g_region = run(True)
+    assert "attn_res_energy_U" in g_region and g_region["attn_res_energy_U"].abs().sum() > 0
+    torch.testing.assert_close(l_region, l_eager, rtol=1e-4, atol=1e-5)
+    assert g_region.keys() == g_eager.keys()
+    for n in g_eager:
+        torch.testing.assert_close(g_region[n], g_eager[n], rtol=2e-3, atol=1e-5, msg=n)
