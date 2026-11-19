@@ -186,7 +186,8 @@ def test_eval_alphas_log_tv(ids):
     with torch.no_grad():
         m(ids)
     assert len(m._energy_tv) > 0
-    assert max(tv for _site, tv in m._energy_tv) > 0
+    assert all(tv.shape == ids.shape for _site, tv in m._energy_tv)
+    assert max(float(tv.mean()) for _site, tv in m._energy_tv) > 0
 
 
 def test_energy_telemetry(ids):
@@ -203,3 +204,46 @@ def test_energy_telemetry(ids):
     out1 = tel(m, 2)
     assert out1["energy/sigma_abs/layer_1/attn"] == pytest.approx(0.5)
     assert out1["energy/sigma_step_abs_mean"] > 0 and out1["energy/sigma_update_ratio"] > 0 and out1["energy/u_drift"] > 0
+
+
+class _StubTok:
+    """Just what the induction batch needs: special ids and no eos (the tiny model's vocab is 199)."""
+    all_special_ids = [0]
+    eos_token_id = None
+
+    def __len__(self) -> int:
+        return 199
+
+
+def test_inloop_energy_suite(tmp_path):
+    from kotodama.training.inloop import InloopConfig, InloopEvaluator
+    m = _model(**ENERGY); _queries_nonzero(m)
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if n.endswith("res_energy_sigma") and p.requires_grad:
+                p.fill_(2.0)
+    m.train()
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    cfg = InloopConfig(suites=["energy"], max_batch_tokens=64, induction_n_seqs=4, induction_len=16)
+    ev = InloopEvaluator(cfg, out_dir=tmp_path, rank=0, world_size=1, device=torch.device("cpu"),
+                         max_seq_len=96, vocab_size=199, tokenizer=_StubTok())
+    out = ev.run(0, m)
+    assert out is not None and out["inloop/errors"] == 0
+    for k in ("induction_gain_normalized", "loss_first", "loss_second"):
+        assert out[f"inloop/energy/{k}_delta"] == pytest.approx(out[f"inloop/energy/{k}_on"] - out[f"inloop/energy/{k}_off"])
+    assert out["inloop/energy/loss_second_delta"] != 0                    # sigma = 2 changes the routing
+    assert out["inloop/energy/tv_first_mean"] > 0 and out["inloop/energy/tv_second_mean"] > 0
+    assert any(k.startswith("inloop/energy/tv_second/layer_") for k in out)
+    assert m.training and m.config.attn_res_energy_steps == 2 and getattr(m, "_energy_tv", None) is None
+    for k, v in m.state_dict().items():                                    # eval only: no weight moved
+        assert torch.equal(v, before[k]), k
+
+
+def test_inloop_energy_suite_refuses_plain_model(tmp_path):
+    from kotodama.training.inloop import InloopConfig, InloopEvaluator
+    m = _model(); m.train()
+    cfg = InloopConfig(suites=["energy"], max_batch_tokens=64, induction_n_seqs=4, induction_len=16)
+    ev = InloopEvaluator(cfg, out_dir=tmp_path, rank=0, world_size=1, device=torch.device("cpu"),
+                         max_seq_len=96, vocab_size=199, tokenizer=_StubTok())
+    out = ev.run(0, m)
+    assert out is not None and out["inloop/errors"] == 1                    # reported, not raised

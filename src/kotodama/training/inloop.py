@@ -63,7 +63,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-SUITES: tuple[str, ...] = ("riders", "setbind", "induction", "uncheatable", "nca_gates")
+SUITES: tuple[str, ...] = ("riders", "setbind", "induction", "uncheatable", "nca_gates", "energy")
 _SUITE_ALIASES = {"riders_lite": "riders", "uncheatable_mini": "uncheatable",
                   "nca": "nca_gates"}
 DEFAULT_SUITES: tuple[str, ...] = ("riders",)
@@ -343,7 +343,7 @@ class InloopEvaluator:
         self.steps: list[int] = []
         self.pending: set[int] = set()
         self.notes: dict[str, Any] = {}
-        need_tok = bool({"riders", "setbind", "uncheatable", "induction"} & set(cfg.suites))
+        need_tok = bool({"riders", "setbind", "uncheatable", "induction", "energy"} & set(cfg.suites))
         self.tok = tokenizer if tokenizer is not None else (_load_tokenizer() if need_tok else None)
         text_suites = sorted({"riders", "setbind", "uncheatable"} & set(cfg.suites))
         if text_suites and len(self.tok) > vocab_size:
@@ -354,7 +354,7 @@ class InloopEvaluator:
             self._prep_riders()
         if "setbind" in cfg.suites:
             self._prep_setbind()
-        if "induction" in cfg.suites:
+        if "induction" in cfg.suites or "energy" in cfg.suites:   # energy reuses the induction batch
             self._prep_induction()
         if "uncheatable" in cfg.suites:
             self._prep_uncheatable()
@@ -579,6 +579,8 @@ class InloopEvaluator:
             bs = max(1, self.cfg.max_batch_tokens // self.i_ids.shape[1])
             losses = token_losses(model_fn, self.i_ids[idx], batch_size=bs, device=str(self.device))
             return [(i, losses[k].tolist()) for k, i in enumerate(idx)]
+        if suite == "energy":
+            return self._local_energy(model_fn)
         if suite == "uncheatable":
             from kotodama.eval.uncheatable import doc_nll
             out = []
@@ -594,6 +596,46 @@ class InloopEvaluator:
             return [(i, row) for (i, _), row in zip(mine, rows)]
         raise ValueError(f"unknown suite {suite!r}")
 
+    def _local_energy(self, model_fn: Callable[[torch.Tensor], dict[str, torch.Tensor]]) -> Any:
+        """Energy routing, on the induction batch (PREREG-energy-routing's in-loop decomposition), per sequence:
+        token losses with the energy on and off (the same weights, the router's steps set to 0), and per routing site
+        the token-mean TV between the energy and one-softmax weights over the first copy of the prefix (new text) and
+        the second (copyable text). Needs an energy-routed model; eval only, the weights are never touched."""
+        from kotodama.eval.induction import token_losses
+        raw = self._raw
+        steps = int(getattr(raw.config, "attn_res_energy_steps", 0))
+        if steps <= 0:
+            raise ValueError("the energy suite needs an energy-routed model (attn_res_energy_steps > 0)")
+        mine = shard(range(self.i_ids.shape[0]), self.rank, self.world_size)
+        if not mine:
+            return []
+        idx = [i for i, _ in mine]
+        ids = self.i_ids[idx]
+        L, off = self.cfg.induction_len, self.i_offset
+        bs = max(1, self.cfg.max_batch_tokens // ids.shape[1])
+        out = []
+        for b0 in range(0, len(idx), bs):
+            chunk = ids[b0:b0 + bs]
+            raw._energy_tv = []
+            try:
+                on = token_losses(model_fn, chunk, batch_size=len(chunk), device=str(self.device))
+                sinks = raw._energy_tv
+            finally:
+                raw._energy_tv = None
+            raw.config.attn_res_energy_steps = 0
+            try:
+                off_l = token_losses(model_fn, chunk, batch_size=len(chunk), device=str(self.device))
+            finally:
+                raw.config.attn_res_energy_steps = steps
+            names = [f"{site[0]}/{site[1]}" for site, _t in sinks]
+            # (sites, B, 2): per sequence, the mean TV over the first and the second copy; one host transfer
+            halves = torch.stack([torch.stack([t[:, off:off + L].float().mean(1), t[:, off + L:off + 2 * L].float().mean(1)], -1)
+                                  for _site, t in sinks]).cpu().tolist() if sinks else []
+            for k in range(len(chunk)):
+                tv = {nm: (halves[j][k][0], halves[j][k][1]) for j, nm in enumerate(names)}
+                out.append((idx[b0 + k], {"on": on[k].tolist(), "off": off_l[k].tolist(), "tv": tv}))
+        return out
+
     def run(self, step: int, model: torch.nn.Module, tokens_consumed: int = 0,
             stop_requested: bool = False) -> Optional[dict[str, float]]:
         """Score every suite at ``step``. EVERY rank must call this at the same steps.
@@ -605,6 +647,7 @@ class InloopEvaluator:
             return None
         t0 = time.time()
         raw = unwrap_model(model)
+        self._raw = raw
         was_training = raw.training
         raw.eval()
         local: dict[str, dict[str, Any]] = {}
@@ -719,6 +762,32 @@ class InloopEvaluator:
         keys = ("induction_gain", "induction_gain_normalized", "induction_gain_se",
                 "loss_first", "loss_second")
         return ({f"induction/{k}": float(agg[k]) for k in keys}, [agg])
+
+    def _reduce_energy(self, data: list[Any]) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        from kotodama.eval.induction import aggregate_induction
+        n = int(self.i_ids.shape[0])
+        per = merge_shards(data, n)
+        m: dict[str, float] = {}
+        agg = {}
+        for arm in ("on", "off"):
+            losses = torch.tensor([r[arm] for r in per], dtype=torch.float32)
+            agg[arm] = aggregate_induction(losses, self.cfg.induction_len, self.i_offset, n_candidates=self.i_ncand)
+            for k in ("induction_gain_normalized", "loss_first", "loss_second"):
+                m[f"energy/{k}_{arm}"] = float(agg[arm][k])
+        for k in ("induction_gain_normalized", "loss_first", "loss_second"):
+            m[f"energy/{k}_delta"] = m[f"energy/{k}_on"] - m[f"energy/{k}_off"]
+        sites = sorted(per[0]["tv"])
+        first_all, second_all = [], []
+        for site in sites:
+            f = sum(r["tv"][site][0] for r in per) / n
+            s = sum(r["tv"][site][1] for r in per) / n
+            layer, sub = site.split("/")
+            m[f"energy/tv_first/layer_{layer}/{sub}"] = f
+            m[f"energy/tv_second/layer_{layer}/{sub}"] = s
+            first_all.append(f); second_all.append(s)
+        m["energy/tv_first_mean"] = sum(first_all) / max(len(first_all), 1)
+        m["energy/tv_second_mean"] = sum(second_all) / max(len(second_all), 1)
+        return m, [{"agg_on": agg["on"], "agg_off": agg["off"]}]
 
     def _reduce_uncheatable(self, data: list[Any]) -> tuple[dict[str, float], list[dict[str, Any]]]:
         from kotodama.eval.uncheatable import bpb_from_sums

@@ -374,7 +374,7 @@ def _compute_routing_alphas(
 
     ``energy`` = (U, sigma, steps, norm_weight) for an energy-routed site: the weights are then the final ones, and
     ``tv_sink`` (if given) receives (site, token-mean total-variation distance between the final and the one-softmax
-    weights)."""
+    weights, as a per-token (B, T) tensor)."""
     if n_committed == 0:
         return torch.ones(1, *partial.shape[:2], device=partial.device)
     all_src = torch.cat([committed_stack[:n_committed], partial.unsqueeze(0)], dim=0)
@@ -382,8 +382,8 @@ def _compute_routing_alphas(
         from kotodama.model import energy_route as er
         U, sigma, steps, norm_weight = energy
         _h, a, a0 = er.route_energy(all_src, qw, norm_weight, eps, U, sigma, steps)
-        if tv_sink is not None:
-            tv_sink.append((site, 0.5 * (a.float() - a0.float()).abs().sum(0).mean().item()))
+        if tv_sink is not None:   # per-token TV (B, T): callers split it by position
+            tv_sink.append((site, 0.5 * (a.float() - a0.float()).abs().sum(0)))
         return a.float()
     rsqrt = torch.rsqrt(all_src.pow(2).mean(-1) + eps)
     logits = (all_src * qw).sum(-1) * rsqrt
