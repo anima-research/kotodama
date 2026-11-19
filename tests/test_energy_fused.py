@@ -148,3 +148,22 @@ def test_layer_scope_regions_route_with_energy():
     assert g_region.keys() == g_eager.keys()
     for n in g_eager:
         torch.testing.assert_close(g_region[n], g_eager[n], rtol=2e-3, atol=1e-5, msg=n)
+
+
+def test_layer_scope_regions_train_every_sigma():
+    """From σ = 0 (the init), one optimizer step under layer-scope regions moves every trainable σ (train's
+    frozen_energy_sigmas finds none): a partial skip, some in-region sites without the energy, would leave theirs at 0."""
+    ids = torch.randint(3, 199, (2, 24), generator=torch.Generator().manual_seed(4))
+    torch.manual_seed(20261119)
+    m = KotodamaModel(KotodamaModelConfig(**BASE)).train()
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        for name, p in m.named_parameters():
+            if name.endswith("res_query"):
+                p.copy_(torch.randn(p.shape, generator=g))
+    assert train.frozen_energy_sigmas(m)            # every σ starts at 0
+    m.compile_regions(scope="layer")
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-2)
+    m(ids, labels=ids)["loss"].backward()
+    opt.step()
+    assert train.frozen_energy_sigmas(m) == []
