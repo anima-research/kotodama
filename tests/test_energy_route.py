@@ -247,3 +247,20 @@ def test_inloop_energy_suite_refuses_plain_model(tmp_path):
                          max_seq_len=96, vocab_size=199, tokenizer=_StubTok())
     out = ev.run(0, m)
     assert out is not None and out["inloop/errors"] == 1                    # reported, not raised
+
+
+def test_frozen_energy_sigmas_flags_a_dead_energy_path(ids):
+    """The fail-fast guard: sigmas still exactly zero after optimizer steps mean no forward path routed with the
+    energy. A real energy forward moves them on the first AdamW step; a forward that skips the energy leaves them."""
+    from kotodama.training.train import frozen_energy_sigmas
+    m = _model(**ENERGY); _queries_nonzero(m); m.train()
+    n_sig = sum(1 for n, p in m.named_parameters() if n.endswith("res_energy_sigma") and p.requires_grad)
+    assert n_sig > 0 and len(frozen_energy_sigmas(m)) == n_sig          # at init, every sigma is zero
+    opt = torch.optim.AdamW([p for n, p in m.named_parameters() if "res_energy" in n], lr=1e-3, weight_decay=0.0)
+    m(ids, labels=ids)["loss"].backward(); opt.step()
+    assert len(frozen_energy_sigmas(m)) < n_sig                          # the energy path trains sigma
+    dead = _model(**ENERGY); _queries_nonzero(dead); dead.train()
+    dead.config.attn_res_energy_steps = 0                                # a forward that routes without the energy
+    opt = torch.optim.AdamW([p for n, p in dead.named_parameters() if "res_energy" in n], lr=1e-3, weight_decay=0.0)
+    dead(ids, labels=ids)["loss"].backward(); opt.step()
+    assert len(frozen_energy_sigmas(dead)) == n_sig
