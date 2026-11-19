@@ -304,9 +304,10 @@ def frozen_routing_queries(model: torch.nn.Module) -> list[str]:
 
 def frozen_energy_sigmas(model: torch.nn.Module) -> list[str]:
     """Trainable energy-routing sigmas still exactly zero (their init). sigma's gradient is nonzero from the first step
-    whenever a site routes with its energy, so after a few optimizer steps an all-zero set means no forward path passed
-    the energy (the run is the one-softmax router with dead parameters). Reads full values (collective on a sharded
-    model)."""
+    at every site that routes with its energy (every trainable site has >= 2 sources; the first boundary's sigma is
+    frozen), so after a few optimizer steps any zero sigma marks a site whose forward skipped the energy. A partial
+    skip is the likely failure: a path that drops the energy at some call sites while block-start routes keep it.
+    Reads full values (collective on a sharded model)."""
     names: list[str] = []
     for name, p in model.named_parameters():
         if name.endswith("res_energy_sigma") and p.requires_grad and torch.count_nonzero(_full_f32(p)) == 0:
@@ -1757,10 +1758,10 @@ def train(args: argparse.Namespace) -> None:
         # Energy routing that no forward path passes is silently the plain router: fail fast.
         if step == FROZEN_ROUTING_CHECK_STEP and getattr(config, "attn_res_energy_steps", 0) > 0 and config.attn_res:
             _dead = frozen_energy_sigmas(raw_model)
-            _n_sig = sum(1 for n, p in raw_model.named_parameters() if n.endswith("res_energy_sigma") and p.requires_grad)
-            if _n_sig and len(_dead) == _n_sig:
-                raise RuntimeError(f"all {_n_sig} energy-routing sigmas are still exactly zero at step {step}: no forward "
-                                   f"path routes with the energy (e.g. a compile scope that calls the router without it)")
+            if _dead:
+                raise RuntimeError(f"{len(_dead)} energy-routing sigmas are still exactly zero at step {step}, e.g. "
+                                   f"{_dead[:3]}: their sites route without the energy (e.g. a compile scope that calls "
+                                   f"the router without it)")
 
         # Optimizer step (--time_optimizer_step: wall time of the two steps on log steps, between device syncs)
         _time_opt = getattr(args, "time_optimizer_step", False) and (

@@ -258,7 +258,11 @@ def test_frozen_energy_sigmas_flags_a_dead_energy_path(ids):
     assert n_sig > 0 and len(frozen_energy_sigmas(m)) == n_sig          # at init, every sigma is zero
     opt = torch.optim.AdamW([p for n, p in m.named_parameters() if "res_energy" in n], lr=1e-3, weight_decay=0.0)
     m(ids, labels=ids)["loss"].backward(); opt.step()
-    assert len(frozen_energy_sigmas(m)) < n_sig                          # the energy path trains sigma
+    assert frozen_energy_sigmas(m) == []                                 # the energy path trains every sigma
+    with torch.no_grad():                                                # one site that skipped the energy
+        name, p = next((n, p) for n, p in m.named_parameters() if n.endswith("mlp_res_energy_sigma") and p.requires_grad)
+        p.zero_()
+    assert frozen_energy_sigmas(m) == [name]
     dead = _model(**ENERGY); _queries_nonzero(dead); dead.train()
     dead.config.attn_res_energy_steps = 0                                # a forward that routes without the energy
     opt = torch.optim.AdamW([p for n, p in dead.named_parameters() if "res_energy" in n], lr=1e-3, weight_decay=0.0)
