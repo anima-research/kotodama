@@ -462,6 +462,14 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     loaded = _load_checkpoint(ckpt_path)
 
     state_dict = loaded.get("model", loaded)
+    if "attn_res_energy_U" in state_dict and config.attn_res_energy_steps == 0:
+        # An energy-routed checkpoint describes itself: steps from its saved buffer, rank from U's width.
+        model_cfg["attn_res_energy_steps"] = int(state_dict["attn_res_energy_steps_buf"])
+        model_cfg["attn_res_energy_rank"] = int(state_dict["attn_res_energy_U"].shape[1])
+        config = KotodamaModelConfig(**model_cfg)
+        logger.info("Energy-routed checkpoint: %d steps, rank %d", config.attn_res_energy_steps,
+                    config.attn_res_energy_rank)
+        model = KotodamaModel(config, init_weights=False)
     model.load_state_dict(state_dict, strict=True)
     logger.info("Checkpoint loaded (step %s, %s tokens)", loaded.get("step", "?"), loaded.get("tokens_consumed", "?"))
     del state_dict
@@ -479,7 +487,8 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
     if _device.type == "cuda":
         model = model.bfloat16()
 
-    use_engine = engine == "fast" and _device.type == "cuda" and _ENGINE_AVAILABLE and config.attn_res
+    use_engine = (engine == "fast" and _device.type == "cuda" and _ENGINE_AVAILABLE and config.attn_res
+                  and config.attn_res_energy_steps == 0)   # the fast engine's routing is the one-softmax router
     if engine == "fast" and not use_engine:
         logger.warning("--engine fast requested but unavailable (cuda=%s, import=%s, attn_res=%s) — using reference path",
                        _device.type == "cuda", _ENGINE_AVAILABLE, config.attn_res)

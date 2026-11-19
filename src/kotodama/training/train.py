@@ -553,6 +553,8 @@ def build_model_config(args: argparse.Namespace) -> KotodamaModelConfig:
     model_kwargs["attn_res"] = args.attn_res
     model_kwargs["attn_res_n_blocks"] = args.attn_res_n_blocks
     model_kwargs["attn_res_freeze_unused"] = getattr(args, "attn_res_freeze_unused", True)
+    model_kwargs["attn_res_energy_steps"] = getattr(args, "attn_res_energy_steps", 0)
+    model_kwargs["attn_res_energy_rank"] = getattr(args, "attn_res_energy_rank", 32)
     if args.attn_res_boundaries:
         model_kwargs["attn_res_boundaries"] = [int(x) for x in args.attn_res_boundaries.split(",")]
     return KotodamaModelConfig(**model_kwargs)
@@ -2516,6 +2518,15 @@ def parse_args() -> argparse.Namespace:
         "--attn_res_freeze_unused", action="store_true", default=True,
         help="Freeze the first boundary layer's never-used pre-attn routing params "
              "so DDP can run with find_unused_parameters=False (default: on)",
+    )
+    p.add_argument(
+        "--attn_res_energy_steps", type=int, default=0,
+        help="Energy routing (kotodama.model.energy_route): mirror-descent steps per AttnRes site on a learned energy "
+             "over the mixture of sources. 0 = the one-softmax router",
+    )
+    p.add_argument(
+        "--attn_res_energy_rank", type=int, default=32,
+        help="Energy routing: width of the shared source projection U",
     )
     p.add_argument(
         "--no_attn_res_freeze_unused", dest="attn_res_freeze_unused", action="store_false",

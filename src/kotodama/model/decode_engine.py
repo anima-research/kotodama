@@ -181,6 +181,9 @@ class DecodeEngine(nn.Module):
         super().__init__()
         if not model.config.attn_res:
             raise ValueError("DecodeEngine requires an attn_res model")
+        if getattr(model.config, "attn_res_energy_steps", 0) > 0:
+            raise NotImplementedError("DecodeEngine routes with the one-softmax router; an energy-routed model "
+                                      "(attn_res_energy_steps > 0) runs on the model's own forward")
         if max_seq_len is not None and max_seq_len > model.config.max_position_embeddings:
             raise ValueError(
                 f"max_seq_len {max_seq_len} exceeds rope table length "

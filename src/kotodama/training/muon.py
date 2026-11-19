@@ -680,7 +680,8 @@ def build_hybrid_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
+        # The energy-routing projection (attn_res_energy_U) is a routing parameter: AdamW, with the queries.
+        if param.ndim == 2 and "embed" not in name and "lm_head" not in name and "res_energy" not in name:
             m_layer = re.search(r"layers\.(\d+)\.attn\.", name)
             if (attn_group and m_layer and name.endswith("_proj.weight")
                     and (attn_layers is None or int(m_layer.group(1)) in attn_layers)):

@@ -67,6 +67,10 @@ def attn_res_geometry(stated: dict[str, Any] | None, state: dict[str, Any], publ
     out = dict(stated or {})
     if "attn_res" not in out:
         out["attn_res"] = any("attn_res_query" in k for k in state)
+    if "attn_res_energy_U" in state and "attn_res_energy_steps" not in out:
+        # An energy-routed checkpoint describes itself: steps from its saved buffer, rank from U's width.
+        out["attn_res_energy_steps"] = int(state["attn_res_energy_steps_buf"])
+        out["attn_res_energy_rank"] = int(state["attn_res_energy_U"].shape[1])
     if out["attn_res"] and "attn_res_boundaries" not in out and "attn_res_n_blocks" not in out:
         bounds = published.get("attn_res_boundaries")
         source = "the published config"
@@ -160,6 +164,9 @@ def load_model(
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
 
     # Report key mismatches (filter out expected AttnRes key mismatches)
+    energy_mismatch = [k for k in list(missing) + list(unexpected) if "res_energy" in k]
+    if energy_mismatch:   # a router whose energy weights are dropped or invented is a different model: refuse
+        raise ValueError(f"energy-routing keys do not match the model built: {energy_mismatch[:6]}")
     real_missing = [k for k in missing if "attn_res" not in k]
     if real_missing:
         logger.warning("Missing keys in checkpoint: %s", real_missing[:10])

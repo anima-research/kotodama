@@ -101,6 +101,8 @@ def instrumented_forward(model, input_ids, light=False, routing_only=False):
     routing) — for positional-mean calibration where only the residual is needed (≈10× faster, low-memory).
     `routing_only=True`: SDPA attn + capture ONLY `routing` — for layer × source routing reads over many
     tokens (no O(S²) attention maps held)."""
+    if getattr(getattr(model, "config", None), "attn_res_energy_steps", 0) > 0:
+        raise NotImplementedError("capture mirrors the one-softmax router; an energy-routed model (attn_res_energy_steps > 0) has no capture path")
     if light and routing_only:
         raise ValueError("light and routing_only capture disjoint surfaces; pick one")
     keep_routing = not light
@@ -428,6 +430,8 @@ def cached_forward(
                 committed only, and only when `capture_hidden`)
       new_cache KotoKVCache extended by these positions
     """
+    if getattr(getattr(model, "config", None), "attn_res_energy_steps", 0) > 0:
+        raise NotImplementedError("capture mirrors the one-softmax router; an energy-routed model (attn_res_energy_steps > 0) has no capture path")
     if light and eager_nocapture:
         raise KotoCaptureError("light and eager_nocapture are mutually exclusive")
     if past is not None and position_offset < past.length:

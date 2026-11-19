@@ -206,6 +206,10 @@ class KotodamaModelConfig:
     loop_start: Optional[int] = None
     loop_len: int = 0
     loop_times: int = 1
+    # Energy routing (kotodama.model.energy_route): every AttnRes site's weights take this many mirror-descent steps on a
+    # learned energy over the mixture of its sources. 0 = the one-softmax router. rank = the shared projection's width.
+    attn_res_energy_steps: int = 0
+    attn_res_energy_rank: int = 32
 
     def __post_init__(self) -> None:
         if self.liger_rmsnorm_tuned_scope not in LIGER_RMSNORM_TUNED_SCOPES:
@@ -216,6 +220,11 @@ class KotodamaModelConfig:
         if self.attn_res_query_norm and self.attn_res_gain == "learned":
             raise ValueError("attn_res_query_norm needs attn_res_gain 'folded' or 'frozen' (a learned gain rescales the "
                              "unit direction per channel)")
+        if self.attn_res_energy_steps < 0 or self.attn_res_energy_rank < 1:
+            raise ValueError(f"attn_res_energy_steps={self.attn_res_energy_steps} (>= 0) and "
+                             f"attn_res_energy_rank={self.attn_res_energy_rank} (>= 1)")
+        if self.attn_res_energy_steps > 0 and not self.attn_res:
+            raise ValueError("attn_res_energy_steps > 0 needs attn_res")
         if self.loop_start is not None:
             end = self.loop_start + self.loop_len * self.loop_times
             if self.loop_start < 0 or self.loop_len < 1 or self.loop_times < 2 or end > self.num_layers:
@@ -356,12 +365,26 @@ def _compute_routing_alphas(
     partial: torch.Tensor,
     qw: torch.Tensor,
     eps: float,
+    energy: Optional[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]] = None,
+    tv_sink: Optional[list[tuple[Any, float]]] = None,
+    site: Any = None,
 ) -> torch.Tensor:
     """Compute routing softmax weights for one routing point. Returns (n_src, B, T) per-token
-    weights (the diagnostics take token means, per-token entropy and the source split)."""
+    weights (the diagnostics take token means, per-token entropy and the source split).
+
+    ``energy`` = (U, sigma, steps, norm_weight) for an energy-routed site: the weights are then the final ones, and
+    ``tv_sink`` (if given) receives (site, token-mean total-variation distance between the final and the one-softmax
+    weights)."""
     if n_committed == 0:
         return torch.ones(1, *partial.shape[:2], device=partial.device)
     all_src = torch.cat([committed_stack[:n_committed], partial.unsqueeze(0)], dim=0)
+    if energy is not None:
+        from kotodama.model import energy_route as er
+        U, sigma, steps, norm_weight = energy
+        _h, a, a0 = er.route_energy(all_src, qw, norm_weight, eps, U, sigma, steps)
+        if tv_sink is not None:
+            tv_sink.append((site, 0.5 * (a.float() - a0.float()).abs().sum(0).mean().item()))
+        return a.float()
     rsqrt = torch.rsqrt(all_src.pow(2).mean(-1) + eps)
     logits = (all_src * qw).sum(-1) * rsqrt
     return F.softmax(logits.float(), dim=0)
@@ -377,6 +400,7 @@ def _compute_attn_res_diagnostics(
     intermediate_alphas: Optional[list[tuple[int, str, torch.Tensor]]] = None,
     block_ranges: Optional[list[tuple[int, int]]] = None,
     keep_alpha_means: bool = False,
+    energy_final: Optional[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]] = None,
 ) -> dict[str, float]:
     """Compute per-block norms, final routing weights, and intermediate routing stats.
 
@@ -404,9 +428,14 @@ def _compute_attn_res_diagnostics(
     all_src = committed + [partial]
     src = torch.stack(all_src, dim=0)
     qw = final_query * final_norm_weight
-    rsqrt = torch.rsqrt(src.pow(2).mean(-1) + eps)
-    logits = (src * qw).sum(-1) * rsqrt
-    weights = F.softmax(logits, dim=0)
+    if energy_final is not None:   # (U, sigma, steps, norm_weight): the final site is energy-routed
+        from kotodama.model import energy_route as er
+        U, sigma, steps, norm_weight = energy_final
+        weights = er.route_energy(src, qw, norm_weight, eps, U, sigma, steps)[1].float()
+    else:
+        rsqrt = torch.rsqrt(src.pow(2).mean(-1) + eps)
+        logits = (src * qw).sum(-1) * rsqrt
+        weights = F.softmax(logits, dim=0)
     avg_w = weights.mean(dim=(1, 2))
     for i in range(len(all_src)):
         label = f"block_{i}" if i < len(committed) else "partial"
@@ -901,6 +930,10 @@ class TransformerBlock(nn.Module):
             self.attn_res_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
             self.mlp_res_query = nn.Parameter(torch.zeros(config.hidden_size))
             self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            if config.attn_res_energy_steps > 0:
+                # Energy routing: per-site weights of the mixture term (zero = the one-softmax router).
+                self.attn_res_energy_sigma = nn.Parameter(torch.zeros(config.attn_res_energy_rank))
+                self.mlp_res_energy_sigma = nn.Parameter(torch.zeros(config.attn_res_energy_rank))
 
     def forward(
         self,
@@ -1055,6 +1088,17 @@ class KotodamaModel(nn.Module):
         if config.attn_res:
             self.final_res_query = nn.Parameter(torch.zeros(config.hidden_size))
             self.final_res_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+            if config.attn_res_energy_steps > 0:
+                self.final_res_energy_sigma = nn.Parameter(torch.zeros(config.attn_res_energy_rank))
+                # The shared projection U (D x r). Drawn from its own generator, so the global RNG stream (and with it
+                # every other weight's init) is the same as without energy routing.
+                g = torch.Generator().manual_seed(20261118)
+                self.attn_res_energy_U = nn.Parameter(
+                    torch.randn(config.hidden_size, config.attn_res_energy_rank, generator=g)
+                    / math.sqrt(config.hidden_size))
+                # Saved with the weights, so a checkpoint says how many steps it was trained with.
+                self.register_buffer("attn_res_energy_steps_buf",
+                                     torch.tensor(config.attn_res_energy_steps, dtype=torch.int64))
             # Precompute block boundaries — explicit list or derived from n_blocks
             if config.attn_res_boundaries is not None:
                 self._attn_res_boundary_set = frozenset(config.attn_res_boundaries)
@@ -1100,6 +1144,8 @@ class KotodamaModel(nn.Module):
                 first_boundary_layer = self.layers[sorted_boundaries[0]]
                 first_boundary_layer.attn_res_query.requires_grad_(False)
                 first_boundary_layer.attn_res_norm.weight.requires_grad_(False)
+                if config.attn_res_energy_steps > 0:
+                    first_boundary_layer.attn_res_energy_sigma.requires_grad_(False)
             if config.attn_res_gain != "learned":
                 for _query, norm in self._attn_res_query_norm_pairs():
                     norm.weight.requires_grad_(False)
@@ -1203,8 +1249,11 @@ class KotodamaModel(nn.Module):
         norm: nn.Module,
         active_mask: torch.Tensor,
         num_active: int = 0,
+        energy: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     ) -> torch.Tensor:
         """Compute Block Attention Residual routing with fixed-shape masked softmax.
+
+        ``energy`` = (U, sigma, steps) routes the site with energy routing (kotodama.model.energy_route) instead.
 
         All tensor shapes are static (determined by max_sources at init), enabling
         torch.compile to trace a single graph without breaks.
@@ -1223,6 +1272,11 @@ class KotodamaModel(nn.Module):
         """
         qw = query * norm.weight  # (D,)
         eps = norm.eps
+
+        if energy is not None:
+            from kotodama.model import energy_route as er
+            U, sigma, steps = energy
+            return er.route_energy(buf, qw, norm.weight, eps, U, sigma, steps, active_mask=active_mask)[0]
 
         if buf.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
             from .flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
@@ -1265,8 +1319,12 @@ class KotodamaModel(nn.Module):
         query: torch.Tensor,
         norm: nn.Module,
         link: Optional[torch.Tensor] = None,
+        energy: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Route using Phase 1 (inter-block attention) + Phase 2 (online merge).
+
+        ``energy`` = (U, sigma, steps) routes the site with energy routing (kotodama.model.energy_route), in PyTorch:
+        the fused kernels return only the mixture, not the per-source weights the iteration needs.
 
         Eliminates _pad_and_stack entirely. Phase 1 attends over committed blocks,
         Phase 2 merges the result with the current partial via online softmax.
@@ -1280,6 +1338,12 @@ class KotodamaModel(nn.Module):
 
         qw = query * norm.weight
         eps = norm.eps
+
+        if energy is not None:
+            from kotodama.model import energy_route as er
+            U, sigma, steps = energy
+            return er.route_energy_split(committed_stack[:n_committed], partial, qw, norm.weight, eps,
+                                         U, sigma, steps), link
 
         if committed_stack is not None and committed_stack.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
             # NOTE: use the module-level op bindings (imported at line ~60).
@@ -1329,6 +1393,25 @@ class KotodamaModel(nn.Module):
             qws.append(self.final_res_query * self.final_res_norm.weight)
         return qws
 
+    @property
+    def _energy_on(self) -> bool:
+        return self.config.attn_res and self.config.attn_res_energy_steps > 0
+
+    def _energy_for(self, owner: nn.Module, kind: str) -> Optional[tuple[torch.Tensor, torch.Tensor, int]]:
+        """(U, sigma, steps) for one routing site (kind: attn | mlp | final), or None without energy routing."""
+        if not self._energy_on:
+            return None
+        return self.attn_res_energy_U, getattr(owner, f"{kind}_res_energy_sigma"), self.config.attn_res_energy_steps
+
+    def _energy_capture(self, owner: nn.Module, kind: str, site: Any) -> dict[str, Any]:
+        """kwargs for _compute_routing_alphas at one site: energy-aware weights, and the TV log when
+        ``self._energy_tv`` is a list (set it to [] before an eval forward to collect it)."""
+        if not self._energy_on:
+            return {}
+        U, sigma, steps = self._energy_for(owner, kind)
+        return {"energy": (U, sigma, steps, getattr(owner, f"{kind}_res_norm").weight),
+                "tv_sink": getattr(self, "_energy_tv", None), "site": site}
+
     def _forward_attn_res(
         self,
         embed: torch.Tensor,
@@ -1359,7 +1442,7 @@ class KotodamaModel(nn.Module):
             rope_cos = rope_cos[position_ids]
             rope_sin = rope_sin[position_ids]
         block_ranges = self._attn_res_block_ranges
-        batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda
+        batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda and not self._energy_on
         chain = _TRITON_ATTN_RES_AVAILABLE and _STACK_GRAD_CHAIN and embed.is_cuda and not batch_p1
         stack_link: Optional[torch.Tensor] = None
 
@@ -1393,11 +1476,14 @@ class KotodamaModel(nn.Module):
                 h_attn, stack_link = self._route_p12(
                     committed_stack, n_committed, partial,
                     self.layers[block_start].attn_res_query,
-                    self.layers[block_start].attn_res_norm, stack_link)
+                    self.layers[block_start].attn_res_norm, stack_link,
+                    energy=self._energy_for(self.layers[block_start], "attn"))
             if capture_routing and n_committed > 0:
                 qw = self.layers[block_start].attn_res_query * self.layers[block_start].attn_res_norm.weight
                 intermediate_alphas.append((block_start, "pre_attn",
-                    _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
+                    _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps,
+                                            **self._energy_capture(self.layers[block_start], "attn",
+                                                                   (block_start, "pre_attn")))))
 
             # ── Commit at boundary ────────────────────────────────────
             committed.append(partial)
@@ -1452,11 +1538,13 @@ class KotodamaModel(nn.Module):
                     else:
                         h_attn, stack_link = self._route_p12(
                             committed_stack, n_committed, partial,
-                            lyr.attn_res_query, lyr.attn_res_norm, stack_link)
+                            lyr.attn_res_query, lyr.attn_res_norm, stack_link,
+                            energy=self._energy_for(lyr, "attn"))
                     if capture_routing:
                         qw = lyr.attn_res_query * lyr.attn_res_norm.weight
                         intermediate_alphas.append((i, "pre_attn",
-                            _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
+                            _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps,
+                                                    **self._energy_capture(lyr, "attn", (i, "pre_attn")))))
 
                 # Attention
                 if use_ac:
@@ -1477,11 +1565,13 @@ class KotodamaModel(nn.Module):
                 else:
                     h_mlp, stack_link = self._route_p12(
                         committed_stack, n_committed, partial,
-                        lyr.mlp_res_query, lyr.mlp_res_norm, stack_link)
+                        lyr.mlp_res_query, lyr.mlp_res_norm, stack_link,
+                        energy=self._energy_for(lyr, "mlp"))
                 if capture_routing:
                     qw = lyr.mlp_res_query * lyr.mlp_res_norm.weight
                     intermediate_alphas.append((i, "pre_mlp",
-                        _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps)))
+                        _compute_routing_alphas(committed_stack, n_committed, partial, qw, eps,
+                                                **self._energy_capture(lyr, "mlp", (i, "pre_mlp")))))
 
                 # MLP
                 if use_ac:
@@ -1504,7 +1594,8 @@ class KotodamaModel(nn.Module):
         else:
             h_final, stack_link = self._route_p12(
                 committed_stack, len(committed), partial,
-                self.final_res_query, self.final_res_norm, stack_link)
+                self.final_res_query, self.final_res_norm, stack_link,
+                energy=self._energy_for(self, "final"))
 
         if not self.training:
             self._last_attn_res_diagnostics = _compute_attn_res_diagnostics(
@@ -1513,6 +1604,8 @@ class KotodamaModel(nn.Module):
                 intermediate_alphas=intermediate_alphas,
                 block_ranges=block_ranges,
                 keep_alpha_means=getattr(self, "_attn_res_diag_keep_alphas", False),
+                energy_final=(None if not self._energy_on else
+                              (*self._energy_for(self, "final"), self.final_res_norm.weight)),
             )
 
         return self.norm(h_final)
@@ -1544,7 +1637,8 @@ class KotodamaModel(nn.Module):
 
         for i, layer in enumerate(self.layers):
             buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i], int(active_counts[2 * i]))
+            h = self._route_static(buf, layer.attn_res_query, layer.attn_res_norm, masks[2 * i], int(active_counts[2 * i]),
+                                   energy=self._energy_for(layer, "attn"))
 
             if i in boundary_set:
                 committed.append(partial.clone())
@@ -1556,13 +1650,15 @@ class KotodamaModel(nn.Module):
             partial = partial + attn_out
 
             buf = _pad_and_stack(committed, partial)
-            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1], int(active_counts[2 * i + 1]))
+            h = self._route_static(buf, layer.mlp_res_query, layer.mlp_res_norm, masks[2 * i + 1], int(active_counts[2 * i + 1]),
+                                   energy=self._energy_for(layer, "mlp"))
 
             mlp_out = layer.ffn(layer.ffn_norm(h))
             partial = partial + mlp_out
 
         buf = _pad_and_stack(committed, partial)
-        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]))
+        x = self._route_static(buf, self.final_res_query, self.final_res_norm, masks[2 * self.config.num_layers], int(active_counts[2 * self.config.num_layers]),
+                               energy=self._energy_for(self, "final"))
         return self.norm(x), new_kv_list
 
     def forward(
