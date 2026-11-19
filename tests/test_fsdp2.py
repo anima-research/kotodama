@@ -409,6 +409,58 @@ def test_compiled_layers_match_eager_units(layers_per_group, ac, reshard, tmp_pa
     _spawn(_layer_compile_worker, 2, tmp_path, layers_per_group, ac, reshard)
 
 
+ENERGY_CFG = dict(hidden_size=64, num_layers=7, num_attention_heads=4, num_kv_heads=2, head_dim=16,
+                  intermediate_size=128, vocab_size=199, max_position_embeddings=96, attn_impl="sdpa",
+                  attn_res=True, attn_res_boundaries=[0, 2, 5], use_liger=False,
+                  loop_start=1, loop_len=2, loop_times=2, attn_res_energy_steps=2, attn_res_energy_rank=8)
+
+
+def _energy_layer_worker(rank: int, world: int, init_file: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kotodama.training.fsdp import compile_fsdp_layers
+
+    _init(rank, world, init_file)
+    mesh = init_device_mesh("cpu", (world,))
+    torch.manual_seed(20261119)
+    ref = KotodamaModel(KotodamaModelConfig(**ENERGY_CFG))
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():  # a live energy route: nonzero sigma, non-trivial queries
+        for name, p in ref.named_parameters():
+            if name.endswith("res_query") or name.endswith("res_energy_sigma"):
+                p.copy_(torch.randn(p.shape, generator=g) * (0.5 if "sigma" in name else 1.0))
+    models = []
+    for _ in range(2):
+        m = copy.deepcopy(ref)
+        params_to_fp32(m)
+        apply_fsdp2(m, mesh, param_dtype=None, layers_per_group=1)
+        models.append(m)
+    units, regions = models
+    compile_fsdp_layers(regions, backend="eager")
+    ids = torch.randint(3, 199, (2, 24), generator=torch.Generator().manual_seed(3 + rank))
+    losses, grads = [], []
+    for m in (units, regions):
+        loss = m(ids, labels=ids)["loss"]
+        loss.backward()
+        losses.append(loss.detach())
+        grads.append({n: _full(p.grad) for n, p in m.named_parameters()
+                      if p.grad is not None and ("energy" in n or "res_query" in n)})
+    torch.testing.assert_close(losses[1], losses[0], rtol=1e-4, atol=1e-5)
+    assert grads[1].keys() == grads[0].keys()
+    u = [n for n in grads[1] if n.endswith("res_energy_U")]
+    assert u and all(grads[1][n].abs().sum() > 0 for n in u), u  # a region that dropped energy leaves U gradless
+    for n in grads[0]:
+        assert _rel(grads[1][n], grads[0][n]) < 1e-4, n
+    dist.destroy_process_group()
+
+
+def test_fsdp2_layer_regions_route_with_energy(tmp_path):
+    """FSDP2's layer-scope regions (compile_fsdp_layers: the region runs inside the group's gather hooks, and the
+    energy tuples reach it by keyword, outside the group's input cast) route every site with energy: the same loss
+    and energy/query gradients as FSDP2's eager units, and U receives a gradient."""
+    _spawn(_energy_layer_worker, 2, tmp_path)
+
+
 def _collective_count_worker(rank: int, world: int, init_file: str, reshard: bool, ac: bool) -> None:
     from torch.distributed.device_mesh import init_device_mesh
 
