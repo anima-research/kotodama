@@ -125,6 +125,7 @@ def _init_fa4() -> bool:
 
 ATTN_RES_GAIN_MODES = ("learned", "frozen", "folded")
 COMPILE_REGION_SCOPES = ("sublayer", "layer")
+ENERGY_IMPLS = ("torch", "fused")
 
 
 class UnitRoutingQuery(nn.Module):
@@ -210,6 +211,9 @@ class KotodamaModelConfig:
     # learned energy over the mixture of its sources. 0 = the one-softmax router. rank = the shared projection's width.
     attn_res_energy_steps: int = 0
     attn_res_energy_rank: int = 32
+    # How the committed/partial energy route runs: "torch" (kotodama.model.energy_route) or "fused" (Triton,
+    # kotodama.model.energy_fused; same op, falls back to torch outside its shape support).
+    attn_res_energy_impl: str = "torch"
 
     def __post_init__(self) -> None:
         if self.liger_rmsnorm_tuned_scope not in LIGER_RMSNORM_TUNED_SCOPES:
@@ -223,6 +227,8 @@ class KotodamaModelConfig:
         if self.attn_res_energy_steps < 0 or self.attn_res_energy_rank < 1:
             raise ValueError(f"attn_res_energy_steps={self.attn_res_energy_steps} (>= 0) and "
                              f"attn_res_energy_rank={self.attn_res_energy_rank} (>= 1)")
+        if self.attn_res_energy_impl not in ENERGY_IMPLS:
+            raise ValueError(f"attn_res_energy_impl={self.attn_res_energy_impl!r}; expected one of {ENERGY_IMPLS}")
         if self.attn_res_energy_steps > 0 and not self.attn_res:
             raise ValueError("attn_res_energy_steps > 0 needs attn_res")
         if self.loop_start is not None:
@@ -1275,7 +1281,7 @@ class KotodamaModel(nn.Module):
 
         if energy is not None:
             from kotodama.model import energy_route as er
-            U, sigma, steps = energy
+            U, sigma, steps, _impl = energy             # the padded-buffer path stays on PyTorch
             return er.route_energy(buf, qw, norm.weight, eps, U, sigma, steps, active_mask=active_mask)[0]
 
         if buf.is_cuda and _TRITON_ATTN_RES_AVAILABLE:
@@ -1340,8 +1346,12 @@ class KotodamaModel(nn.Module):
         eps = norm.eps
 
         if energy is not None:
+            U, sigma, steps, impl = energy
+            if impl == "fused":
+                from kotodama.model.energy_fused import route_energy_split_fused
+                return route_energy_split_fused(committed_stack[:n_committed], partial, qw, norm.weight, eps,
+                                                U, sigma, steps), link
             from kotodama.model import energy_route as er
-            U, sigma, steps = energy
             return er.route_energy_split(committed_stack[:n_committed], partial, qw, norm.weight, eps,
                                          U, sigma, steps), link
 
@@ -1397,18 +1407,20 @@ class KotodamaModel(nn.Module):
     def _energy_on(self) -> bool:
         return self.config.attn_res and self.config.attn_res_energy_steps > 0
 
-    def _energy_for(self, owner: nn.Module, kind: str) -> Optional[tuple[torch.Tensor, torch.Tensor, int]]:
-        """(U, sigma, steps) for one routing site (kind: attn | mlp | final), or None without energy routing."""
+    def _energy_for(self, owner: nn.Module, kind: str) -> Optional[tuple[torch.Tensor, torch.Tensor, int, str]]:
+        """(U, sigma, steps, impl) for one routing site (kind: attn | mlp | final), or None without energy routing.
+        impl = config.attn_res_energy_impl: the committed/partial split runs fused when "fused" (and supported)."""
         if not self._energy_on:
             return None
-        return self.attn_res_energy_U, getattr(owner, f"{kind}_res_energy_sigma"), self.config.attn_res_energy_steps
+        return (self.attn_res_energy_U, getattr(owner, f"{kind}_res_energy_sigma"), self.config.attn_res_energy_steps,
+                self.config.attn_res_energy_impl)
 
     def _energy_capture(self, owner: nn.Module, kind: str, site: Any) -> dict[str, Any]:
         """kwargs for _compute_routing_alphas at one site: energy-aware weights, and the TV log when
         ``self._energy_tv`` is a list (set it to [] before an eval forward to collect it)."""
         if not self._energy_on:
             return {}
-        U, sigma, steps = self._energy_for(owner, kind)
+        U, sigma, steps, _impl = self._energy_for(owner, kind)
         return {"energy": (U, sigma, steps, getattr(owner, f"{kind}_res_norm").weight),
                 "tv_sink": getattr(self, "_energy_tv", None), "site": site}
 
@@ -1605,7 +1617,7 @@ class KotodamaModel(nn.Module):
                 block_ranges=block_ranges,
                 keep_alpha_means=getattr(self, "_attn_res_diag_keep_alphas", False),
                 energy_final=(None if not self._energy_on else
-                              (*self._energy_for(self, "final"), self.final_res_norm.weight)),
+                              (*self._energy_for(self, "final")[:3], self.final_res_norm.weight)),
             )
 
         return self.norm(h_final)
