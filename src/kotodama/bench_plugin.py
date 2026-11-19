@@ -32,10 +32,11 @@ def load_koto(spec: "ModelSpec", device: str) -> "LoadedModel":
     model, _ = server.load_model(spec.path, device=device, model_size=spec.size)
     model.eval()
     tok = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    if getattr(model.config, "attn_res", False):
+    if getattr(model.config, "attn_res", False) and getattr(model.config, "attn_res_energy_steps", 0) <= 0:
         def fwd(ids: torch.Tensor) -> torch.Tensor:
             return capture.instrumented_forward(model, ids, light=True)[0]
-    else:   # the capture walker is AttnRes-only; a plain-residual model's own forward is the reference
+    else:   # the capture walker covers the one-softmax AttnRes router only; plain-residual and energy-routed models
+        # score through their own forward, which the capture walker is parity-tested against
         def fwd(ids: torch.Tensor) -> torch.Tensor:
             return model(ids)["logits"]
     msl = getattr(model.config, "max_seq_len", None) or getattr(model.config, "max_position_embeddings", None)
