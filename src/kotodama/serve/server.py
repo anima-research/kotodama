@@ -471,6 +471,10 @@ def load_model(checkpoint_path: str, device: str = "cuda", mode: str = "base", m
                     config.attn_res_energy_rank)
         model = KotodamaModel(config, init_weights=False)
     model.load_state_dict(state_dict, strict=True)
+    if config.attn_res_energy_steps > 0 and os.environ.get("KOTODAMA_ENERGY_OFF") == "1":
+        # Ablation: the same weights served with the one-softmax router (the energy's steps set to 0).
+        config.attn_res_energy_steps = 0
+        logger.warning("KOTODAMA_ENERGY_OFF=1: energy routing OFF for this server (same weights, one-softmax router)")
     logger.info("Checkpoint loaded (step %s, %s tokens)", loaded.get("step", "?"), loaded.get("tokens_consumed", "?"))
     del state_dict
     del loaded
