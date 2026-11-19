@@ -1443,7 +1443,7 @@ class KotodamaModel(nn.Module):
             rope_sin = rope_sin[position_ids]
         block_ranges = self._attn_res_block_ranges
         batch_p1 = _TRITON_ATTN_RES_AVAILABLE and _BATCH_PHASE1 and embed.is_cuda and not self._energy_on
-        chain = _TRITON_ATTN_RES_AVAILABLE and _STACK_GRAD_CHAIN and embed.is_cuda and not batch_p1
+        chain = _TRITON_ATTN_RES_AVAILABLE and _STACK_GRAD_CHAIN and embed.is_cuda and not batch_p1 and not self._energy_on
         stack_link: Optional[torch.Tensor] = None
 
         committed: list[torch.Tensor] = []
