@@ -1504,6 +1504,8 @@ def train(args: argparse.Namespace) -> None:
     _guard_steps = int(getattr(args, "rank_data_guard_steps", 20) or 0)
     _fsdp2_defer = bool(getattr(args, "fsdp2_defer_grad_sync", False))
     _hsdp = use_fsdp2 and int(getattr(args, "fsdp2_replicas", 1)) > 1
+    # Energy routing telemetry (every log step): sigma's size, step size and update ratio, and U's drift from its init.
+    _energy_tel = EnergyTelemetry(raw_model) if getattr(raw_model.config, "attn_res_energy_steps", 0) > 0 else None
     _debug_hash_steps = int(os.environ.get("KOTODAMA_DEBUG_BATCH_HASH", "0") or 0)
     _balance_stats: dict[str, float] = {}  # the last step's deal (--balance_windows), logged with the step
 
@@ -1772,6 +1774,8 @@ def train(args: argparse.Namespace) -> None:
         _norm_gains = (_norm_gain_metrics(raw_model)
                        if (is_main or use_fsdp2) and _log_now and _ng_every > 0
                        and (step % _ng_every == 0 or step == loop_end - 1) else None)
+        _energy_stats = (_energy_tel(raw_model, max(log_steps, 1))
+                         if _energy_tel is not None and (is_main or use_fsdp2) and _log_now else None)
         if is_main and _log_now:
             elapsed = time.time() - step_t0
             avg_loss = log_loss_accum / max(log_steps, 1)
@@ -1861,6 +1865,8 @@ def train(args: argparse.Namespace) -> None:
 
             if _norm_gains is not None:
                 hm_log(step, **_norm_gains)
+            if is_main and _energy_stats is not None:
+                hm_log(step, **_energy_stats)
 
             # Reset accumulators
             log_loss_accum = 0.0
@@ -2207,6 +2213,51 @@ def param_checksum_spread(model: torch.nn.Module) -> float:
 _LAYER_RE = re.compile(r"layers\.(\d+)\.")
 # An AttnRes routing query: plain (``attn_res_query``) or UnitRoutingQuery's direction / temperature.
 _ROUTER_RE = re.compile(r"(attn|mlp|final)_res_query(\.original|\.0\.temperature)?$")
+
+
+def _full_f32(p: torch.Tensor) -> torch.Tensor:
+    """A parameter's full value in fp32 (a collective for a sharded DTensor)."""
+    return (p.full_tensor() if is_dtensor(p) else p).detach().float()
+
+
+class EnergyTelemetry:
+    """Energy-routing parameters as telemetry (PREREG-energy-routing's sigma diagnostics).
+
+    sigma starts at exactly 0 and is the gate of the whole mechanism, so its trajectory is logged from step 0:
+    ``energy/sigma_abs_mean`` / ``_max`` over every trainable site, ``energy/sigma_step_abs_mean`` (mean |change| per
+    step since the last log), ``energy/sigma_update_ratio`` (that step over the mean |sigma|; 0 while sigma is 0),
+    ``energy/u_drift`` (||U - U_init|| / ||U_init||) and the per-site family ``energy/sigma_abs/layer_{i}/{attn,mlp}``
+    (+ ``energy/sigma_abs/final``). One host sync per call. Reads full values, so on a sharded model every rank calls it
+    (a collective), as with ``_norm_gain_metrics``."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.sites = [(n, p) for n, p in model.named_parameters() if n.endswith("res_energy_sigma") and p.requires_grad]
+        self.keys: list[str] = []
+        for n, _p in self.sites:
+            m = _LAYER_RE.search(n)
+            kind = "attn" if ".attn_res_energy" in n else "mlp"
+            self.keys.append(f"energy/sigma_abs/layer_{m.group(1)}/{kind}" if m else "energy/sigma_abs/final")
+        self.prev = torch.cat([_full_f32(p).flatten() for _n, p in self.sites]).clone()
+        U = _full_f32(model.attn_res_energy_U)
+        self.u0 = U.clone()
+        self.u0_norm = float(U.norm()) or 1.0
+
+    @torch.no_grad()
+    def __call__(self, model: torch.nn.Module, steps_since: int) -> dict[str, float]:
+        full = [_full_f32(p) for _n, p in self.sites]
+        cur = torch.cat([f.flatten() for f in full])
+        per_site = torch.stack([f.abs().mean() for f in full])
+        step_abs = (cur - self.prev).abs().mean() / steps_since
+        abs_mean = cur.abs().mean()
+        u_drift = (_full_f32(model.attn_res_energy_U) - self.u0).norm() / self.u0_norm
+        vals = torch.stack([abs_mean, cur.abs().max(), step_abs, u_drift]).tolist()
+        self.prev = cur.clone()
+        out = {"energy/sigma_abs_mean": vals[0], "energy/sigma_abs_max": vals[1],
+               "energy/sigma_step_abs_mean": vals[2],
+               "energy/sigma_update_ratio": vals[2] / vals[0] if vals[0] > 0 else 0.0,
+               "energy/u_drift": vals[3]}
+        out.update(zip(self.keys, per_site.tolist()))
+        return out
 
 
 def _norm_gain_metrics(model: torch.nn.Module) -> dict[str, float]:

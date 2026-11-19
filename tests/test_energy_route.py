@@ -187,3 +187,19 @@ def test_eval_alphas_log_tv(ids):
         m(ids)
     assert len(m._energy_tv) > 0
     assert max(tv for _site, tv in m._energy_tv) > 0
+
+
+def test_energy_telemetry(ids):
+    from kotodama.training.train import EnergyTelemetry
+    m = _model(**ENERGY); _queries_nonzero(m)
+    tel = EnergyTelemetry(m)
+    out0 = tel(m, 1)
+    assert out0["energy/sigma_abs_mean"] == 0 and out0["energy/sigma_update_ratio"] == 0 and out0["energy/u_drift"] == 0
+    assert "energy/sigma_abs/final" in out0 and "energy/sigma_abs/layer_0/mlp" in out0
+    assert "energy/sigma_abs/layer_0/attn" not in out0          # frozen (never used), not logged
+    with torch.no_grad():
+        m.layers[1].attn_res_energy_sigma.fill_(0.5)
+        m.attn_res_energy_U.add_(0.1)
+    out1 = tel(m, 2)
+    assert out1["energy/sigma_abs/layer_1/attn"] == pytest.approx(0.5)
+    assert out1["energy/sigma_step_abs_mean"] > 0 and out1["energy/sigma_update_ratio"] > 0 and out1["energy/u_drift"] > 0
