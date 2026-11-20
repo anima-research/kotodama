@@ -29,4 +29,6 @@ inloop_evals: riders,induction
 # The trunk and its branches were trained with fp64 AttnRes routing (the forward kernels' eps was a runtime float,
 # which inductor types fp64); keep that lineage's numerics. New runs on this shape: --no_attnres_eps_fp64_compat.
 attnres_eps_fp64_compat: true
+# varlen_dynamic stays off: the trunk trained with static varlen shapes. Forks, resumes and new runs: pass --varlen_dynamic
+# (one compile; without it each rank recompiles on its first new doc count and max_seqlen, at a different step, and DDP waits).
 checkpoint_shm_dir: /dev/shm/kotodama-tsumugi
