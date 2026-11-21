@@ -170,7 +170,7 @@ def test_install_pins_gemm_selection(tmp_path: Path, monkeypatch) -> None:
         timed.append(inputs_key)
         return {c: speeds[c.name] for c in choices}
 
-    monkeypatch.setattr(cls, "_kotodama_unpinned_do_autotuning", fake)
+    monkeypatch.setattr(cls, "_kotodama_unpinned_do_autotuning", fake, raising=False)
     monkeypatch.setattr(cls, "do_autotuning", real)
 
     def select(key: str = "[(128, 1536)]", names=("aten", "tmpl_a", "tmpl_b")):
