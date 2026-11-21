@@ -2243,7 +2243,7 @@ def _full_f32(p: torch.Tensor) -> torch.Tensor:
 
 
 class EnergyTelemetry:
-    """Energy-routing parameters as telemetry (PREREG-energy-routing's sigma diagnostics).
+    """Energy-routing parameters as telemetry: sigma and U.
 
     sigma starts at exactly 0 and is the gate of the whole mechanism, so its trajectory is logged from step 0:
     ``energy/sigma_abs_mean`` / ``_max`` over every trainable site, ``energy/sigma_step_abs_mean`` (mean |change| per

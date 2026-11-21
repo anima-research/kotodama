@@ -597,7 +597,7 @@ class InloopEvaluator:
         raise ValueError(f"unknown suite {suite!r}")
 
     def _local_energy(self, model_fn: Callable[[torch.Tensor], dict[str, torch.Tensor]]) -> Any:
-        """Energy routing, on the induction batch (PREREG-energy-routing's in-loop decomposition), per sequence:
+        """Energy routing's on/off decomposition, on the induction batch, per sequence:
         token losses with the energy on and off (the same weights, the router's steps set to 0), and per routing site
         the token-mean TV between the energy and one-softmax weights over the first copy of the prefix (new text) and
         the second (copyable text). Needs an energy-routed model; eval only, the weights are never touched."""

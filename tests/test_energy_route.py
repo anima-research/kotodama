@@ -1,6 +1,6 @@
 """Energy routing (kotodama.model.energy_route) on a tiny looped AttnRes model.
 
-Gates: at sigma = 0 an energy-routed model is today's model (same init, same logits); the iteration's fixed point is a
+Gates: at sigma = 0 an energy-routed model is the default model (same init, same logits); the iteration's fixed point is a
 stationary point of the energy; the closed-form gradient is autograd's; gradients reach sigma at once and U after
 sigma moves; U trains with AdamW, not Muon; the first boundary site's unused sigma is frozen; the eval loader infers
 the energy fields from a checkpoint and refuses a mismatch; the capture walker refuses an energy-routed model; the
@@ -46,7 +46,7 @@ def ids() -> torch.Tensor:
     return torch.randint(3, 199, (2, 24), dtype=torch.long)
 
 
-def test_sigma_zero_is_todays_model(ids):
+def test_sigma_zero_is_the_default_model(ids):
     base, en = _model(), _model(**ENERGY)
     sb, se = base.state_dict(), en.state_dict()
     for k, v in sb.items():                       # same init for every shared weight (U has its own generator)

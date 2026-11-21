@@ -1,6 +1,6 @@
 """Energy routing for Block AttnRes: the routing weights at a site minimise a learned energy over the simplex.
 
-Today's router is one softmax of a static query against the RMS-normalised sources. That softmax is the exact
+The default router is one softmax of a static query against the RMS-normalised sources. That softmax is the exact
 minimiser of E0(a) = -sum_s a_s l_s + sum_s a_s log a_s, with l_s the routing logits. Energy routing adds a term that
 scores the mixture of sources rather than each source alone:
 
@@ -13,7 +13,7 @@ complementary ones. ``steps`` rounds of mirror descent with unit step on the sim
     a^(0) = softmax(l),    a^(k+1) = softmax(l + P (sigma * c^(k))),
 
 whose fixed point is a stationary point of E. The gradient of E is analytic, so training needs no second-order
-autodiff. With sigma = 0 (its initialisation) the weights are exactly today's softmax.
+autodiff. With sigma = 0 (its initialisation) the weights are exactly the default softmax.
 """
 from __future__ import annotations
 
@@ -72,9 +72,9 @@ def route_energy(sources: torch.Tensor, qw: torch.Tensor, norm_weight: torch.Ten
                  active_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The routed mixture over ``sources`` (S, B, T, D) with energy routing.
 
-    qw = query * norm_weight (the router's pre-weighted query, as today). Returns (h, a_final, a_0); h is (B, T, D) and
+    qw = query * norm_weight (the router's pre-weighted query, as in the default router). Returns (h, a_final, a_0); h is (B, T, D) and
     the weights are (S, B, T). ``active_mask`` (S,) marks real sources in a padded buffer (None: all are real)."""
-    # The (S, B, T, D) sources are only ever read by reductions (matmuls), never copied: memory as today's router.
+    # The (S, B, T, D) sources are only ever read by reductions (matmuls), never copied: memory as the default router.
     rsqrt, logits, P = source_terms(sources, qw, norm_weight, eps, U)
     if active_mask is not None:
         logits = logits.masked_fill(~active_mask.view(-1, *([1] * (logits.dim() - 1))), float("-inf"))
@@ -87,7 +87,7 @@ def source_terms(sources: torch.Tensor, qw: torch.Tensor, norm_weight: torch.Ten
                  U: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(rsqrt, logits, P) for ``sources`` (S, ..., D), as small fp32 tensors (S, ...), (S, ...), (S, ..., r).
 
-    logits match today's router: (source . qw) * rsqrt(mean(source^2) + eps)."""
+    logits match the default router: (source . qw) * rsqrt(mean(source^2) + eps)."""
     D = sources.shape[-1]
     ms = torch.linalg.vector_norm(sources, dim=-1).float().pow(2) / D
     rsqrt = torch.rsqrt(ms + eps)
